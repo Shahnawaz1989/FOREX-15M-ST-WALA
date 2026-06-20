@@ -43,21 +43,16 @@ def _find_nearest_buy_target(
 ) -> Optional[Dict]:
     order = ["buy_t05", "buy_t1", "buy_t125", "buy_t15", "buy_t2"]
     picks = []
-
     for key in order:
         px = levels.get(key)
         if px is None:
             continue
         px = float(px)
-
         if px <= float(entry_price):
             continue
-
         picks.append((abs(px - float(target_price)), px, key))
-
     if not picks:
         return None
-
     picks.sort(key=lambda x: (x[0], x[1]))
     _, px, key = picks[0]
     return {"target_key": key, "target_price": _round5(px)}
@@ -70,50 +65,33 @@ def _find_nearest_sell_target(
 ) -> Optional[Dict]:
     order = ["sell_t05", "sell_t1", "sell_t125", "sell_t15", "sell_t2"]
     picks = []
-
     for key in order:
         px = levels.get(key)
         if px is None:
             continue
         px = float(px)
-
         if px >= float(entry_price):
             continue
-
         picks.append((abs(px - float(target_price)), px, key))
-
     if not picks:
         return None
-
     picks.sort(key=lambda x: (x[0], x[1]))
     _, px, key = picks[0]
     return {"target_key": key, "target_price": _round5(px)}
 
 
-def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
-    import pandas as pd
-
+def _get_h1_context_for_time(engine, ref_time, verbose=False):
     result = {
         "valid": False,
         "h1_atr_raw": None,
         "h1_atr_cmp": None,
-        "result_atr": None,
-        "candidate_atr": None,
-        "candidate_atr_cmp": None,
-        "atr_last_filter_enabled": False,
-        "atr_last_filter_valid": None,
-        "atr_last_filter_threshold": None,
-        "atr_last_filter_value": None,
         "prev_h1_time": None,
         "reason": None,
     }
 
-    xh1 = getattr(self, "h1_atr_df", None)
+    xh1 = getattr(engine, "h1_atr_df", None)
     if xh1 is None or len(xh1) == 0:
         result["reason"] = "no_h1_atr_dataframe"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={breakout_time} | no H1 ATR dataframe available")
         return result
 
     xh1 = xh1.copy()
@@ -125,9 +103,6 @@ def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
         time_col = "datetime"
     else:
         result["reason"] = "h1_time_column_missing"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe has no time/datetime column")
         return result
 
     atr_col = None
@@ -137,9 +112,6 @@ def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
         atr_col = "atr_mt5"
     else:
         result["reason"] = "h1_atr_column_missing"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe has no atr/atr_mt5 column")
         return result
 
     xh1[time_col] = pd.to_datetime(xh1[time_col], errors="coerce")
@@ -152,39 +124,17 @@ def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
 
     if xh1.empty:
         result["reason"] = "h1_atr_dataframe_empty_after_cleanup"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe empty after cleanup")
         return result
 
-    bt = pd.to_datetime(breakout_time, errors="coerce")
+    bt = pd.to_datetime(ref_time, errors="coerce")
     if pd.isna(bt) or bt.year <= 1971:
-        result["reason"] = "invalid_breakout_time"
-        if verbose:
-            print(f" -> ATR_CHECK | invalid breakout_time={breakout_time}")
+        result["reason"] = "invalid_reference_time"
         return result
-
-    try:
-        current_15m_atr = float(candle_15m_atr)
-    except Exception:
-        result["reason"] = "invalid_15m_atr"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={bt} | invalid 15M ATR={candle_15m_atr}")
-        return result
-
-    result["candidate_atr"] = round(current_15m_atr, 5)
-    result["candidate_atr_cmp"] = round(current_15m_atr * 100000, 2)
 
     current_h1_open = bt.floor("1h")
-
     prev_candidates = xh1.loc[xh1[time_col] < current_h1_open]
     if prev_candidates.empty:
         result["reason"] = "no_previous_available_closed_h1_atr"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | no previous available closed H1 ATR"
-            )
         return result
 
     prev_row = prev_candidates.iloc[-1]
@@ -195,42 +145,167 @@ def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
     except Exception:
         result["prev_h1_time"] = prev_time
         result["reason"] = "invalid_previous_h1_atr"
-        if verbose:
-            print(
-                f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | used_prev_available_h1={prev_time} | invalid previous H1 ATR"
-            )
         return result
 
-    h1_atr_cmp = round(prev_h1_atr * 100000, 2)
-    candidate_atr_cmp = round(current_15m_atr * 100000, 2)
-
-    if h1_atr_cmp <= 150:
-        result_atr_cmp = h1_atr_cmp / 2.5
-    else:
-        result_atr_cmp = h1_atr_cmp / 2.70
-
-    result_atr_cmp = round(float(result_atr_cmp), 2)
-    compare_ok = candidate_atr_cmp > result_atr_cmp
-
-    result["valid"] = compare_ok
-    result["h1_atr_raw"] = round(prev_h1_atr, 5)
-    result["h1_atr_cmp"] = h1_atr_cmp
-    result["result_atr"] = result_atr_cmp
-    result["candidate_atr"] = round(current_15m_atr, 5)
-    result["candidate_atr_cmp"] = candidate_atr_cmp
+    result["valid"] = True
+    result["h1_atr_raw"] = _round5(prev_h1_atr)
+    result["h1_atr_cmp"] = round(prev_h1_atr * 100000, 2)
     result["prev_h1_time"] = prev_time
-    result["reason"] = "passed" if compare_ok else "atr_compare_failed"
+    result["reason"] = "passed"
 
     if verbose:
         print(
-            f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | "
-            f"used_prev_available_h1={prev_time} | h1_atr_raw={prev_h1_atr:.6f} | "
-            f"h1_atr_cmp={h1_atr_cmp:.2f} | h1_result_cmp={result_atr_cmp:.2f} | "
-            f"candidate_atr={current_15m_atr:.6f} | candidate_atr_cmp={candidate_atr_cmp:.2f} | "
-            f"pass={compare_ok}"
+            f" -> H1_CONTEXT | ref_time={bt} | used_prev_h1={prev_time} | "
+            f"h1_atr_raw={prev_h1_atr:.6f} | h1_atr_cmp={result['h1_atr_cmp']:.2f}"
         )
 
     return result
+
+
+def _pickup_filter_pass(engine, pickup_time, pickup_atr, verbose=False):
+    result = {
+        "valid": False,
+        "pickup_atr_raw": None,
+        "pickup_atr_cmp": None,
+        "h1_atr_raw": None,
+        "h1_atr_cmp": None,
+        "threshold_cmp": None,
+        "prev_h1_time": None,
+        "reason": None,
+    }
+
+    try:
+        pickup_atr = float(pickup_atr)
+    except Exception:
+        result["reason"] = "pickup_atr_invalid"
+        return result
+
+    if not np.isfinite(pickup_atr) or pickup_atr <= 0:
+        result["reason"] = "pickup_atr_invalid"
+        return result
+
+    h1ctx = _get_h1_context_for_time(engine, pickup_time, verbose=verbose)
+    if not h1ctx["valid"]:
+        result["reason"] = h1ctx["reason"]
+        result["prev_h1_time"] = h1ctx.get("prev_h1_time")
+        return result
+
+    pickup_cmp = round(pickup_atr * 100000, 2)
+    h1_cmp = float(h1ctx["h1_atr_cmp"])
+    threshold_cmp = round(h1_cmp * 0.70, 2)
+
+    compare_ok = pickup_cmp <= threshold_cmp
+
+    result["valid"] = compare_ok
+    result["pickup_atr_raw"] = _round5(pickup_atr)
+    result["pickup_atr_cmp"] = pickup_cmp
+    result["h1_atr_raw"] = h1ctx["h1_atr_raw"]
+    result["h1_atr_cmp"] = h1_cmp
+    result["threshold_cmp"] = threshold_cmp
+    result["prev_h1_time"] = h1ctx["prev_h1_time"]
+    result["reason"] = "passed" if compare_ok else "pickup_atr_compare_failed"
+
+    if verbose:
+        print(
+            f" -> PICKUP_ATR_FILTER | pickup_time={pickup_time} | "
+            f"prev_h1_time={result['prev_h1_time']} | "
+            f"h1_cmp={h1_cmp:.2f} | threshold_cmp={threshold_cmp:.2f} | "
+            f"pickup_cmp={pickup_cmp:.2f} | pass={compare_ok}"
+        )
+
+    return result
+
+
+def _candidate_buffer_from_pickup_atr(pickup_atr: float):
+    cmp_val = round(float(pickup_atr) * 100000, 2)
+
+    if cmp_val <= 30:
+        divisor = 1.0
+    elif cmp_val <= 50:
+        divisor = 2.0
+    elif cmp_val <= 70:
+        divisor = 3.0
+    elif cmp_val <= 100:
+        divisor = 4.0
+    else:
+        divisor = 5.0
+
+    return {
+        "pickup_atr_cmp": cmp_val,
+        "divisor": divisor,
+        "buffer_raw": float(pickup_atr) / divisor,
+        "buffer_cmp": round(cmp_val / divisor, 2),
+    }
+
+
+def _is_st_flip_buy(row):
+    trend = str(row.get("supertrend_direction", "")).upper().strip()
+    signal = str(row.get("supertrend_signal", "")).upper().strip()
+    return signal == "BUY" or trend == "BUY_TREND"
+
+
+def _is_st_flip_sell(row):
+    trend = str(row.get("supertrend_direction", "")).upper().strip()
+    signal = str(row.get("supertrend_signal", "")).upper().strip()
+    return signal == "SELL" or trend == "SELL_TREND"
+
+
+def _find_buy_candidate(xdf: pd.DataFrame, start_idx: int, pickup_high: float, pickup_atr: float):
+    pickup_row = xdf.iloc[start_idx]
+    buf = _candidate_buffer_from_pickup_atr(pickup_atr)
+    breakout_level = float(pickup_high) + float(buf["buffer_raw"])
+
+    if _is_st_flip_buy(pickup_row):
+        return {
+            "candidate_row": pickup_row,
+            "candidate_index": start_idx,
+            "candidate_mode": "PICKUP_ST_SAME_CANDLE",
+            "breakout_level": _round5(breakout_level),
+            "buffer_info": buf,
+        }
+
+    for j in range(start_idx + 1, len(xdf)):
+        r = xdf.iloc[j]
+        c = float(r["close"])
+        if c >= breakout_level and _is_st_flip_buy(r):
+            return {
+                "candidate_row": r,
+                "candidate_index": j,
+                "candidate_mode": "BREAKOUT_CLOSE_WITH_ST_FLIP",
+                "breakout_level": _round5(breakout_level),
+                "buffer_info": buf,
+            }
+
+    return None
+
+
+def _find_sell_candidate(xdf: pd.DataFrame, start_idx: int, pickup_low: float, pickup_atr: float):
+    pickup_row = xdf.iloc[start_idx]
+    buf = _candidate_buffer_from_pickup_atr(pickup_atr)
+    breakout_level = float(pickup_low) - float(buf["buffer_raw"])
+
+    if _is_st_flip_sell(pickup_row):
+        return {
+            "candidate_row": pickup_row,
+            "candidate_index": start_idx,
+            "candidate_mode": "PICKUP_ST_SAME_CANDLE",
+            "breakout_level": _round5(breakout_level),
+            "buffer_info": buf,
+        }
+
+    for j in range(start_idx + 1, len(xdf)):
+        r = xdf.iloc[j]
+        c = float(r["close"])
+        if c <= breakout_level and _is_st_flip_sell(r):
+            return {
+                "candidate_row": r,
+                "candidate_index": j,
+                "candidate_mode": "BREAKOUT_CLOSE_WITH_ST_FLIP",
+                "breakout_level": _round5(breakout_level),
+                "buffer_info": buf,
+            }
+
+    return None
 
 
 def _build_ll_buy_setup(
@@ -254,58 +329,34 @@ def _build_ll_buy_setup(
                         "REJECTED", "pickup_atr_invalid")
         return None
 
-    pickup_open = float(ll_row["open"])
-    pickup_close = float(ll_row["close"])
-    pickup_oc_gap = _round5(abs(pickup_open - pickup_close))
-    pickup_atr15 = _round5(pickup_atr / 15.0)
-
-    if pickup_oc_gap < pickup_atr15:
-        _dbg(
-            hh_debug,
-            f" -> PICKUP_OC_FILTER FAIL | side=BUY | time={picked_time} | "
-            f"oc_gap={pickup_oc_gap:.5f} < atr15={pickup_atr15:.5f}",
-        )
+    pickup_filter = _pickup_filter_pass(
+        engine, picked_time, pickup_atr, verbose=hh_debug)
+    if not pickup_filter["valid"]:
         _record_attempt(
-            all_attempts, side, picked_time, "REJECTED", "pickup_oc_filter_failed"
+            all_attempts,
+            side,
+            picked_time,
+            "REJECTED",
+            pickup_filter["reason"],
+            extra=pickup_filter,
         )
         return None
 
-    pickup_buffer = pickup_atr / 5.0
-    pickup_breakout_level = ll_high + pickup_buffer
-
-    breakout_row = None
-    for j in range(ll_idx + 1, len(xdf)):
-        r = xdf.iloc[j]
-        c = float(r["close"])
-        if c >= pickup_breakout_level:
-            breakout_row = r
-            break
-
-    if breakout_row is None:
+    candidate_info = _find_buy_candidate(xdf, ll_idx, ll_high, pickup_atr)
+    if candidate_info is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "no_breakout_found")
+                        "REJECTED", "no_candidate_found")
         return None
 
+    breakout_row = candidate_info["candidate_row"]
     breakout_time = pd.Timestamp(breakout_row["time"])
     breakout_high = float(breakout_row["high"])
     breakout_close = float(breakout_row["close"])
-
     candidate_atr = float(breakout_row.get("atr", np.nan))
+
     if not np.isfinite(candidate_atr) or candidate_atr <= 0:
         _record_attempt(all_attempts, side, picked_time,
                         "REJECTED", "candidate_atr_invalid")
-        return None
-
-    atr_check = _is_15m_to_1h_positive(
-        engine, breakout_time, candidate_atr, verbose=hh_debug
-    )
-    if not atr_check["valid"]:
-        if atr_check.get("atr_last_filter_enabled") and atr_check.get("atr_last_filter_valid") is False:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "atr_last_roundoff_x2_failed")
-        else:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "atr_compare_failed")
         return None
 
     gann_cmp = _gann_lookup_price(breakout_high)
@@ -321,137 +372,36 @@ def _build_ll_buy_setup(
                         "REJECTED", "buy_at_missing")
         return None
 
-    base_entry_price = _round5(float(gann_levels["buy_at"]))
+    final_entry_price = _round5(float(gann_levels["buy_at"]))
 
-    gap_status = str((gap_info or {}).get("status", "")).upper()
-    first_candle_time = pd.Timestamp(xdf.iloc[0]["time"])
-    pickup_is_first_candle = pd.Timestamp(
-        picked_time) == pd.Timestamp(first_candle_time)
-
-    special_gap_pickup_rule = gap_status in (
-        "GAP_UP", "GAP_DOWN") and pickup_is_first_candle
-
-    h1_cmp_value = float(atr_check.get("h1_atr_cmp") or 0.0)
-    special_atr_multiplier = 3.0 if h1_cmp_value < 50.0 else 1.0
-
-    special_entry_cmp_raw = float(
-        breakout_high + (candidate_atr * special_atr_multiplier)
-    )
-    special_entry_cmp = _round5(special_entry_cmp_raw)
-    special_entry_applied = False
-
-    final_entry_price = base_entry_price
-    final_levels = levels
-    final_gann_levels = gann_levels
-    final_gann_cmp = gann_cmp
-    final_tp_mode = None
-    final_tp_key = None
-    final_tp = None
-    final_sl = None
-
-    if special_entry_cmp_raw >= base_entry_price:
-        special_cmp = _gann_lookup_price(special_entry_cmp_raw)
-        special_gann = engine._get_gann_from_lookup(special_cmp)
-        if not special_gann:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_gann_lookup_failed")
-            return None
-
-        special_levels = StrategyCalculator._extract_levels(special_gann)
-        if special_gann.get("buy_at") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_buy_at_missing")
-            return None
-
-        special_entry_price = _round5(float(special_gann["buy_at"]))
-
-        if special_levels.get("buy_t1") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_buy_t1_missing")
-            return None
-        if special_levels.get("sell_super_middle") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "REJECTED", "special_sell_super_middle_missing")
-            return None
-
-        final_entry_price = special_entry_price
-        final_levels = special_levels
-        final_gann_levels = special_gann
-        final_gann_cmp = special_cmp
-        final_tp_mode = "SPECIAL_CMP_CROSS"
-        final_tp_key = "buy_t1"
-        final_tp = float(final_levels["buy_t1"])
-        final_sl = _round5(float(final_levels["sell_super_middle"]))
-        special_entry_applied = True
-    else:
-        raw_target_result = _round5(breakout_high + candidate_atr * 5.0)
-
-        if raw_target_result <= final_entry_price:
-            final_tp_mode = "TP_EARLY"
-            if final_levels.get("buy_t1") is None:
-                _record_attempt(all_attempts, side, picked_time,
-                                "REJECTED", "buy_t1_missing")
-                return None
-            final_tp_key = "buy_t1"
-            final_tp = float(final_levels["buy_t1"])
-        else:
-            final_tp_mode = "TP_AFTER"
-            nearest = _find_nearest_buy_target(
-                final_levels, raw_target_result, final_entry_price
-            )
-            if not nearest:
-                if final_levels.get("buy_t1") is None:
-                    _record_attempt(all_attempts, side,
-                                    picked_time, "REJECTED", "buy_t1_missing")
-                    return None
-                final_tp_key = "buy_t1"
-                final_tp = float(final_levels["buy_t1"])
-            else:
-                final_tp_key = nearest["target_key"]
-                final_tp = float(nearest["target_price"])
-
-            if final_tp <= final_entry_price:
-                if final_levels.get("buy_t1") is None:
-                    _record_attempt(all_attempts, side,
-                                    picked_time, "REJECTED", "buy_t1_missing")
-                    return None
-                final_tp_key = "buy_t1"
-                final_tp = float(final_levels["buy_t1"])
-
-        if final_levels.get("sell_super_middle") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "sell_super_middle_missing")
-            return None
-
-        final_sl = _round5(
-            float(final_levels["sell_super_middle"]) - (candidate_atr / 10.0)
-        )
-
-        if (
-            gap_status in ("GAP_UP", "GAP_DOWN")
-            and pickup_is_first_candle
-            and final_tp_mode == "TP_EARLY"
-        ):
-            _dbg(
-                hh_debug,
-                " -> GAP_FIRST_PICKUP_EARLY_REJECT | side=BUY | "
-                f"gap_status={gap_status} | picked_time={picked_time} | "
-                f"special_cross=False | tp_mode={final_tp_mode}",
-            )
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "gap_first_pickup_early_reject")
-            return None
-
-    if final_tp is None or final_sl is None:
+    if levels.get("sell_super_middle") is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "tp_or_sl_missing")
+                        "REJECTED", "sell_super_middle_missing")
         return None
 
+    final_sl = _round5(
+        float(levels["sell_super_middle"]) - (candidate_atr / 10.0))
+
     raw_target_result = _round5(breakout_high + candidate_atr * 5.0)
+    nearest = _find_nearest_buy_target(
+        levels, raw_target_result, final_entry_price)
+
+    final_tp_key = None
+    final_tp = None
+    if nearest:
+        final_tp_key = nearest["target_key"]
+        final_tp = float(nearest["target_price"])
+    elif levels.get("buy_t1") is not None:
+        final_tp_key = "buy_t1"
+        final_tp = float(levels["buy_t1"])
+
+    if final_tp is None:
+        _record_attempt(all_attempts, side, picked_time,
+                        "REJECTED", "buy_t1_missing")
+        return None
 
     sl_pips = StrategyCalculator._calc_sl_pips(
-        final_entry_price, final_sl, engine.pair
-    )
+        final_entry_price, final_sl, engine.pair)
     lot = StrategyCalculator.calculate_lot_size(
         fund=float(getattr(engine, "current_fund", 0.0)),
         risk_percent=float(getattr(engine, "initial_risk_percent", 0.0)),
@@ -471,50 +421,35 @@ def _build_ll_buy_setup(
         "entry_mode": "BUY_AT",
         "entry_key": "buy_at",
         "target_mode": final_tp_key.upper() if final_tp_key else None,
-        "tp_mode": final_tp_mode,
+        "tp_mode": "OLD_PLACEHOLDER",
         "trigger_time": breakout_time,
         "picked_candle_time": picked_time,
         "breakout_candle_time": breakout_time,
+        "candidate_mode": candidate_info["candidate_mode"],
         "pivot_low": _round5(ll_low),
         "pivot_ref": _round5(ll_low),
         "base_level": _round5(ll_high),
         "breakout_extreme": _round5(breakout_high),
         "breakout_close": _round5(breakout_close),
         "pickup_atr": _round5(pickup_atr),
-        "pickup_open": _round5(pickup_open),
-        "pickup_close": _round5(pickup_close),
-        "pickup_candle_oc_gap": _round5(pickup_oc_gap),
-        "pickup_atr15": _round5(pickup_atr15),
-        "pickup_oc_filter_valid": pickup_oc_gap >= pickup_atr15,
-        "pickup_buffer_atr5": _round5(pickup_buffer),
-        "pickup_breakout_level": _round5(pickup_breakout_level),
         "candidate_breakout_atr": _round5(candidate_atr),
+        "pickup_filter_valid": pickup_filter["valid"],
+        "pickup_filter_h1_raw": pickup_filter["h1_atr_raw"],
+        "pickup_filter_h1_cmp": pickup_filter["h1_atr_cmp"],
+        "pickup_filter_threshold_cmp": pickup_filter["threshold_cmp"],
+        "pickup_filter_m15_cmp": pickup_filter["pickup_atr_cmp"],
+        "pickup_filter_prev_h1_time": pickup_filter["prev_h1_time"],
+        "pickup_buffer_divisor": candidate_info["buffer_info"]["divisor"],
+        "pickup_buffer_atr": _round5(candidate_info["buffer_info"]["buffer_raw"]),
+        "pickup_breakout_level": candidate_info["breakout_level"],
         "target_result_price": _round5(raw_target_result),
-        "gann_cmp": _round5(final_gann_cmp),
-        "gann_lookup_cmp": _round5(final_gann_cmp),
-        "gann_raw_lookup_input": final_gann_levels.get("raw_lookup_input"),
-        "gann_matched_price": final_gann_levels.get("matched_price"),
-        "gann_levels": final_levels,
-        "atr_compare_h1_raw": atr_check["h1_atr_raw"],
-        "atr_compare_h1_round": atr_check["h1_atr_cmp"],
-        "atr_compare_h1_result": atr_check["result_atr"],
-        "atr_compare_m15_candidate": atr_check["candidate_atr"],
-        "atr_compare_m15_candidate_cmp": atr_check["candidate_atr_cmp"],
-        "atr_compare_valid": atr_check["valid"],
-        "atr_last_filter_enabled": atr_check.get("atr_last_filter_enabled"),
-        "atr_last_filter_valid": atr_check.get("atr_last_filter_valid"),
-        "atr_last_filter_threshold": atr_check.get("atr_last_filter_threshold"),
-        "atr_last_filter_value": atr_check.get("atr_last_filter_value"),
-        "sl_source": "SELL_SUPER_MIDDLE" if special_entry_applied else "SELL_SUPER_MIDDLE_MINUS_ATR10",
+        "gann_cmp": _round5(gann_cmp),
+        "gann_lookup_cmp": _round5(gann_cmp),
+        "gann_raw_lookup_input": gann_levels.get("raw_lookup_input"),
+        "gann_matched_price": gann_levels.get("matched_price"),
+        "gann_levels": levels,
+        "sl_source": "SELL_SUPER_MIDDLE_MINUS_CANDIDATE_ATR10",
         "tp_source": final_tp_key,
-        "gap_status": gap_status,
-        "pickup_is_first_candle": pickup_is_first_candle,
-        "special_gap_pickup_rule": special_gap_pickup_rule,
-        "special_entry_cmp_raw": _round5(special_entry_cmp_raw),
-        "special_entry_cmp": _round5(special_entry_cmp),
-        "special_entry_applied": special_entry_applied,
-        "special_entry_atr_multiplier": special_atr_multiplier,
-        "special_entry_h1_below_50_active": h1_cmp_value < 50.0,
         "status": "PENDING",
         "setup_valid": True,
     }
@@ -556,58 +491,34 @@ def _build_hh_sell_setup(
                         "REJECTED", "pickup_atr_invalid")
         return None
 
-    pickup_open = float(hh_row["open"])
-    pickup_close = float(hh_row["close"])
-    pickup_oc_gap = _round5(abs(pickup_open - pickup_close))
-    pickup_atr15 = _round5(pickup_atr / 15.0)
-
-    if pickup_oc_gap < pickup_atr15:
-        _dbg(
-            hh_debug,
-            f" -> PICKUP_OC_FILTER FAIL | side=SELL | time={picked_time} | "
-            f"oc_gap={pickup_oc_gap:.5f} < atr15={pickup_atr15:.5f}",
-        )
+    pickup_filter = _pickup_filter_pass(
+        engine, picked_time, pickup_atr, verbose=hh_debug)
+    if not pickup_filter["valid"]:
         _record_attempt(
-            all_attempts, side, picked_time, "REJECTED", "pickup_oc_filter_failed"
+            all_attempts,
+            side,
+            picked_time,
+            "REJECTED",
+            pickup_filter["reason"],
+            extra=pickup_filter,
         )
         return None
 
-    pickup_buffer = pickup_atr / 5.0
-    pickup_breakout_level = hh_low - pickup_buffer
-
-    breakout_row = None
-    for j in range(hh_idx + 1, len(xdf)):
-        r = xdf.iloc[j]
-        c = float(r["close"])
-        if c <= pickup_breakout_level:
-            breakout_row = r
-            break
-
-    if breakout_row is None:
+    candidate_info = _find_sell_candidate(xdf, hh_idx, hh_low, pickup_atr)
+    if candidate_info is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "no_breakout_found")
+                        "REJECTED", "no_candidate_found")
         return None
 
+    breakout_row = candidate_info["candidate_row"]
     breakout_time = pd.Timestamp(breakout_row["time"])
     breakout_low = float(breakout_row["low"])
     breakout_close = float(breakout_row["close"])
-
     candidate_atr = float(breakout_row.get("atr", np.nan))
+
     if not np.isfinite(candidate_atr) or candidate_atr <= 0:
         _record_attempt(all_attempts, side, picked_time,
                         "REJECTED", "candidate_atr_invalid")
-        return None
-
-    atr_check = _is_15m_to_1h_positive(
-        engine, breakout_time, candidate_atr, verbose=hh_debug
-    )
-    if not atr_check["valid"]:
-        if atr_check.get("atr_last_filter_enabled") and atr_check.get("atr_last_filter_valid") is False:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "atr_last_roundoff_x2_failed")
-        else:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "atr_compare_failed")
         return None
 
     gann_cmp = _gann_lookup_price(breakout_low)
@@ -623,137 +534,36 @@ def _build_hh_sell_setup(
                         "REJECTED", "sell_at_missing")
         return None
 
-    base_entry_price = _round5(float(gann_levels["sell_at"]))
+    final_entry_price = _round5(float(gann_levels["sell_at"]))
 
-    gap_status = str((gap_info or {}).get("status", "")).upper()
-    first_candle_time = pd.Timestamp(xdf.iloc[0]["time"])
-    pickup_is_first_candle = pd.Timestamp(
-        picked_time) == pd.Timestamp(first_candle_time)
-
-    special_gap_pickup_rule = gap_status in (
-        "GAP_UP", "GAP_DOWN") and pickup_is_first_candle
-
-    h1_cmp_value = float(atr_check.get("h1_atr_cmp") or 0.0)
-    special_atr_multiplier = 3.0 if h1_cmp_value < 50.0 else 1.0
-
-    special_entry_cmp_raw = float(
-        breakout_low - (candidate_atr * special_atr_multiplier)
-    )
-    special_entry_cmp = _round5(special_entry_cmp_raw)
-    special_entry_applied = False
-
-    final_entry_price = base_entry_price
-    final_levels = levels
-    final_gann_levels = gann_levels
-    final_gann_cmp = gann_cmp
-    final_tp_mode = None
-    final_tp_key = None
-    final_tp = None
-    final_sl = None
-
-    if special_entry_cmp_raw <= base_entry_price:
-        special_cmp = _gann_lookup_price(special_entry_cmp_raw)
-        special_gann = engine._get_gann_from_lookup(special_cmp)
-        if not special_gann:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_gann_lookup_failed")
-            return None
-
-        special_levels = StrategyCalculator._extract_levels(special_gann)
-        if special_gann.get("sell_at") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_sell_at_missing")
-            return None
-
-        special_entry_price = _round5(float(special_gann["sell_at"]))
-
-        if special_levels.get("sell_t1") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_sell_t1_missing")
-            return None
-        if special_levels.get("buy_super_middle") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "special_buy_super_middle_missing")
-            return None
-
-        final_entry_price = special_entry_price
-        final_levels = special_levels
-        final_gann_levels = special_gann
-        final_gann_cmp = special_cmp
-        final_tp_mode = "SPECIAL_CMP_CROSS"
-        final_tp_key = "sell_t1"
-        final_tp = float(final_levels["sell_t1"])
-        final_sl = _round5(float(final_levels["buy_super_middle"]))
-        special_entry_applied = True
-    else:
-        raw_target_result = _round5(breakout_low - candidate_atr * 5.0)
-
-        if raw_target_result >= final_entry_price:
-            final_tp_mode = "TP_EARLY"
-            if final_levels.get("sell_t1") is None:
-                _record_attempt(all_attempts, side, picked_time,
-                                "REJECTED", "sell_t1_missing")
-                return None
-            final_tp_key = "sell_t1"
-            final_tp = float(final_levels["sell_t1"])
-        else:
-            final_tp_mode = "TP_AFTER"
-            nearest = _find_nearest_sell_target(
-                final_levels, raw_target_result, final_entry_price
-            )
-            if not nearest:
-                if final_levels.get("sell_t1") is None:
-                    _record_attempt(all_attempts, side, picked_time,
-                                    "REJECTED", "sell_t1_missing")
-                    return None
-                final_tp_key = "sell_t1"
-                final_tp = float(final_levels["sell_t1"])
-            else:
-                final_tp_key = nearest["target_key"]
-                final_tp = float(nearest["target_price"])
-
-            if final_tp >= final_entry_price:
-                if final_levels.get("sell_t1") is None:
-                    _record_attempt(all_attempts, side, picked_time,
-                                    "REJECTED", "sell_t1_missing")
-                    return None
-                final_tp_key = "sell_t1"
-                final_tp = float(final_levels["sell_t1"])
-
-        if final_levels.get("buy_super_middle") is None:
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "buy_super_middle_missing")
-            return None
-
-        final_sl = _round5(
-            float(final_levels["buy_super_middle"]) + (candidate_atr / 10.0)
-        )
-
-        if (
-            gap_status in ("GAP_UP", "GAP_DOWN")
-            and pickup_is_first_candle
-            and final_tp_mode == "TP_EARLY"
-        ):
-            _dbg(
-                hh_debug,
-                " -> GAP_FIRST_PICKUP_EARLY_REJECT | side=SELL | "
-                f"gap_status={gap_status} | picked_time={picked_time} | "
-                f"special_cross=False | tp_mode={final_tp_mode}",
-            )
-            _record_attempt(all_attempts, side, picked_time,
-                            "REJECTED", "gap_first_pickup_early_reject")
-            return None
-
-    if final_tp is None or final_sl is None:
+    if levels.get("buy_super_middle") is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "tp_or_sl_missing")
+                        "REJECTED", "buy_super_middle_missing")
         return None
 
+    final_sl = _round5(
+        float(levels["buy_super_middle"]) + (candidate_atr / 10.0))
+
     raw_target_result = _round5(breakout_low - candidate_atr * 5.0)
+    nearest = _find_nearest_sell_target(
+        levels, raw_target_result, final_entry_price)
+
+    final_tp_key = None
+    final_tp = None
+    if nearest:
+        final_tp_key = nearest["target_key"]
+        final_tp = float(nearest["target_price"])
+    elif levels.get("sell_t1") is not None:
+        final_tp_key = "sell_t1"
+        final_tp = float(levels["sell_t1"])
+
+    if final_tp is None:
+        _record_attempt(all_attempts, side, picked_time,
+                        "REJECTED", "sell_t1_missing")
+        return None
 
     sl_pips = StrategyCalculator._calc_sl_pips(
-        final_entry_price, final_sl, engine.pair
-    )
+        final_entry_price, final_sl, engine.pair)
     lot = StrategyCalculator.calculate_lot_size(
         fund=float(getattr(engine, "current_fund", 0.0)),
         risk_percent=float(getattr(engine, "initial_risk_percent", 0.0)),
@@ -773,50 +583,35 @@ def _build_hh_sell_setup(
         "entry_mode": "SELL_AT",
         "entry_key": "sell_at",
         "target_mode": final_tp_key.upper() if final_tp_key else None,
-        "tp_mode": final_tp_mode,
+        "tp_mode": "OLD_PLACEHOLDER",
         "trigger_time": breakout_time,
         "picked_candle_time": picked_time,
         "breakout_candle_time": breakout_time,
+        "candidate_mode": candidate_info["candidate_mode"],
         "pivot_high": _round5(hh_high),
         "pivot_ref": _round5(hh_high),
         "base_level": _round5(hh_low),
         "breakout_extreme": _round5(breakout_low),
         "breakout_close": _round5(breakout_close),
         "pickup_atr": _round5(pickup_atr),
-        "pickup_open": _round5(pickup_open),
-        "pickup_close": _round5(pickup_close),
-        "pickup_candle_oc_gap": _round5(pickup_oc_gap),
-        "pickup_atr15": _round5(pickup_atr15),
-        "pickup_oc_filter_valid": pickup_oc_gap >= pickup_atr15,
-        "pickup_buffer_atr5": _round5(pickup_buffer),
-        "pickup_breakout_level": _round5(pickup_breakout_level),
         "candidate_breakout_atr": _round5(candidate_atr),
+        "pickup_filter_valid": pickup_filter["valid"],
+        "pickup_filter_h1_raw": pickup_filter["h1_atr_raw"],
+        "pickup_filter_h1_cmp": pickup_filter["h1_atr_cmp"],
+        "pickup_filter_threshold_cmp": pickup_filter["threshold_cmp"],
+        "pickup_filter_m15_cmp": pickup_filter["pickup_atr_cmp"],
+        "pickup_filter_prev_h1_time": pickup_filter["prev_h1_time"],
+        "pickup_buffer_divisor": candidate_info["buffer_info"]["divisor"],
+        "pickup_buffer_atr": _round5(candidate_info["buffer_info"]["buffer_raw"]),
+        "pickup_breakout_level": candidate_info["breakout_level"],
         "target_result_price": _round5(raw_target_result),
-        "gann_cmp": _round5(final_gann_cmp),
-        "gann_lookup_cmp": _round5(final_gann_cmp),
-        "gann_raw_lookup_input": final_gann_levels.get("raw_lookup_input"),
-        "gann_matched_price": final_gann_levels.get("matched_price"),
-        "gann_levels": final_levels,
-        "atr_compare_h1_raw": atr_check["h1_atr_raw"],
-        "atr_compare_h1_round": atr_check["h1_atr_cmp"],
-        "atr_compare_h1_result": atr_check["result_atr"],
-        "atr_compare_m15_candidate": atr_check["candidate_atr"],
-        "atr_compare_m15_candidate_cmp": atr_check["candidate_atr_cmp"],
-        "atr_compare_valid": atr_check["valid"],
-        "atr_last_filter_enabled": atr_check.get("atr_last_filter_enabled"),
-        "atr_last_filter_valid": atr_check.get("atr_last_filter_valid"),
-        "atr_last_filter_threshold": atr_check.get("atr_last_filter_threshold"),
-        "atr_last_filter_value": atr_check.get("atr_last_filter_value"),
-        "sl_source": "BUY_SUPER_MIDDLE" if special_entry_applied else "BUY_SUPER_MIDDLE_PLUS_ATR10",
+        "gann_cmp": _round5(gann_cmp),
+        "gann_lookup_cmp": _round5(gann_cmp),
+        "gann_raw_lookup_input": gann_levels.get("raw_lookup_input"),
+        "gann_matched_price": gann_levels.get("matched_price"),
+        "gann_levels": levels,
+        "sl_source": "BUY_SUPER_MIDDLE_PLUS_CANDIDATE_ATR10",
         "tp_source": final_tp_key,
-        "gap_status": gap_status,
-        "pickup_is_first_candle": pickup_is_first_candle,
-        "special_gap_pickup_rule": special_gap_pickup_rule,
-        "special_entry_cmp_raw": _round5(special_entry_cmp_raw),
-        "special_entry_cmp": _round5(special_entry_cmp),
-        "special_entry_applied": special_entry_applied,
-        "special_entry_atr_multiplier": special_atr_multiplier,
-        "special_entry_h1_below_50_active": h1_cmp_value < 50.0,
         "status": "PENDING",
         "setup_valid": True,
     }
@@ -858,73 +653,25 @@ def build_setup_for_day(
         .reset_index(drop=True)
     )
 
-    for col in ["open", "high", "low", "close", "atr"]:
+    required_cols = ["open", "high", "low", "close", "atr"]
+    for col in required_cols:
         if col in xdf.columns:
             xdf[col] = pd.to_numeric(xdf[col], errors="coerce")
 
-    xdf = (
-        xdf.dropna(subset=["open", "high", "low", "close", "atr"])
-        .reset_index(drop=True)
-    )
+    xdf = xdf.dropna(subset=required_cols).reset_index(drop=True)
 
     if xdf.empty:
         print(" [SETUP DEBUG] xdf empty after numeric cleanup -> no setup")
         return {"chosen_setups": [], "all_setups": []}
 
-    print("\n[SETUP DEBUG] ----------------------------------------")
-    print(f"[SETUP DEBUG] pair={getattr(engine, 'pair', 'NA')}")
-    print(f"[SETUP DEBUG] rows={len(xdf)}")
-    print(f"[SETUP DEBUG] first_time={xdf.iloc[0]['time']}")
-    print(f"[SETUP DEBUG] last_time={xdf.iloc[-1]['time']}")
-    print("[SETUP DEBUG] last candles:")
-    print(xdf[["time", "open", "high", "low", "close", "atr"]].tail(
-        10).to_string(index=False))
-
     all_attempts: List[Dict] = []
 
     buy_setup = _build_ll_buy_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=True, gap_info=gap_info
+        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
     )
     sell_setup = _build_hh_sell_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=True, gap_info=gap_info
+        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
     )
-
-    buy_attempts = [a for a in all_attempts if str(
-        a.get("side", "")).upper() == "BUY"]
-    sell_attempts = [a for a in all_attempts if str(
-        a.get("side", "")).upper() == "SELL"]
-
-    if buy_setup:
-        print(
-            f"[SETUP DEBUG] BUY VALID | picked={buy_setup.get('picked_candle_time')} "
-            f"trigger={buy_setup.get('trigger_time')} "
-            f"entry={buy_setup.get('entry')} sl={buy_setup.get('sl')} tp={buy_setup.get('tp')}"
-        )
-    else:
-        if buy_attempts:
-            last = buy_attempts[-1]
-            print(
-                f"[SETUP DEBUG] BUY REJECTED | picked={last.get('picked_candle_time')} "
-                f"reason={last.get('reason')} extra={last}"
-            )
-        else:
-            print("[SETUP DEBUG] BUY REJECTED | no attempt recorded")
-
-    if sell_setup:
-        print(
-            f"[SETUP DEBUG] SELL VALID | picked={sell_setup.get('picked_candle_time')} "
-            f"trigger={sell_setup.get('trigger_time')} "
-            f"entry={sell_setup.get('entry')} sl={sell_setup.get('sl')} tp={sell_setup.get('tp')}"
-        )
-    else:
-        if sell_attempts:
-            last = sell_attempts[-1]
-            print(
-                f"[SETUP DEBUG] SELL REJECTED | picked={last.get('picked_candle_time')} "
-                f"reason={last.get('reason')} extra={last}"
-            )
-        else:
-            print("[SETUP DEBUG] SELL REJECTED | no attempt recorded")
 
     chosen_setups: List[Dict] = []
     if buy_setup:
@@ -933,21 +680,6 @@ def build_setup_for_day(
         chosen_setups.append(sell_setup)
 
     chosen_setups.sort(key=lambda s: pd.Timestamp(s["trigger_time"]))
-
-    print(f"[SETUP DEBUG] chosen_setups_count={len(chosen_setups)}")
-    if chosen_setups:
-        for s in chosen_setups:
-            print(
-                f"[SETUP DEBUG] CHOSEN | side={s.get('side')} "
-                f"trigger={s.get('trigger_time')} entry={s.get('entry')} "
-                f"sl={s.get('sl')} tp={s.get('tp')}"
-            )
-    else:
-        print("[SETUP DEBUG] no chosen setups")
-
-    print("[SETUP DEBUG] all_attempts:")
-    for a in all_attempts:
-        print(f"  -> {a}")
 
     return {
         "chosen_setups": chosen_setups,
@@ -960,25 +692,13 @@ def invalidate_pending_setup_on_new_pivot(
     intraday_df: pd.DataFrame,
 ) -> Dict:
     if not setup:
-        return {
-            "active_setup": None,
-            "cancelled": False,
-            "reason": "setup_missing",
-        }
+        return {"active_setup": None, "cancelled": False, "reason": "setup_missing"}
 
     if intraday_df is None or intraday_df.empty:
-        return {
-            "active_setup": setup,
-            "cancelled": False,
-            "reason": "intraday_df_missing",
-        }
+        return {"active_setup": setup, "cancelled": False, "reason": "intraday_df_missing"}
 
     if str(setup.get("status", "")).upper() != "PENDING":
-        return {
-            "active_setup": setup,
-            "cancelled": False,
-            "reason": "setup_not_pending",
-        }
+        return {"active_setup": setup, "cancelled": False, "reason": "setup_not_pending"}
 
     side = str(setup.get("side", "")).upper().strip()
     trigger_time = pd.Timestamp(setup["trigger_time"])
@@ -999,13 +719,8 @@ def invalidate_pending_setup_on_new_pivot(
     )
 
     after_trigger = xdf.loc[xdf["time"] > trigger_time].copy()
-
     if after_trigger.empty:
-        return {
-            "active_setup": setup,
-            "cancelled": False,
-            "reason": "no_data_after_trigger",
-        }
+        return {"active_setup": setup, "cancelled": False, "reason": "no_data_after_trigger"}
 
     cancelled_setup = dict(setup)
 
@@ -1023,18 +738,10 @@ def invalidate_pending_setup_on_new_pivot(
             inv_hit.iloc[0]["time"]) if not inv_hit.empty else None
 
         if first_inv_time is None:
-            return {
-                "active_setup": setup,
-                "cancelled": False,
-                "reason": "no_new_ll",
-            }
+            return {"active_setup": setup, "cancelled": False, "reason": "no_new_ll"}
 
         if first_fill_time is not None and first_fill_time <= first_inv_time:
-            return {
-                "active_setup": setup,
-                "cancelled": False,
-                "reason": "entry_hit_before_new_ll",
-            }
+            return {"active_setup": setup, "cancelled": False, "reason": "entry_hit_before_new_ll"}
 
         first_hit = inv_hit.iloc[0]
         cancelled_setup["status"] = "CANCELLED"
@@ -1063,18 +770,10 @@ def invalidate_pending_setup_on_new_pivot(
             inv_hit.iloc[0]["time"]) if not inv_hit.empty else None
 
         if first_inv_time is None:
-            return {
-                "active_setup": setup,
-                "cancelled": False,
-                "reason": "no_new_hh",
-            }
+            return {"active_setup": setup, "cancelled": False, "reason": "no_new_hh"}
 
         if first_fill_time is not None and first_fill_time <= first_inv_time:
-            return {
-                "active_setup": setup,
-                "cancelled": False,
-                "reason": "entry_hit_before_new_hh",
-            }
+            return {"active_setup": setup, "cancelled": False, "reason": "entry_hit_before_new_hh"}
 
         first_hit = inv_hit.iloc[0]
         cancelled_setup["status"] = "CANCELLED"
@@ -1089,8 +788,4 @@ def invalidate_pending_setup_on_new_pivot(
             "reason": "new_higher_high_found_while_pending",
         }
 
-    return {
-        "active_setup": setup,
-        "cancelled": False,
-        "reason": "unknown_side",
-    }
+    return {"active_setup": setup, "cancelled": False, "reason": "unknown_side"}

@@ -1015,8 +1015,10 @@ class BacktestEngine1HORB:
                 if getattr(self, "stop_requested", False):
                     break
 
+                self.pair = pair
                 week_num, risk_percent = get_weekly_risk_percent(self, day)
                 day_risk_percent = risk_percent
+                self.initial_risk_percent = float(risk_percent)
 
                 bridge_data = fetch_mt5_h1_m15_atr(
                     symbol=pair,
@@ -1053,12 +1055,21 @@ class BacktestEngine1HORB:
                     m15 = m15atr.copy()
                     m15["time"] = pd.to_datetime(m15["time"], errors="coerce")
                     m15["atr"] = pd.to_numeric(m15["atr"], errors="coerce")
-                    df = df.merge(
-                        m15[["time", "atr"]],
-                        on="time",
-                        how="left",
-                        suffixes=("", "_m15_bridge"),
-                    )
+                    m15 = m15[["time", "atr"]].rename(
+                        columns={"atr": "atr_bridge_m15"})
+
+                    df = df.merge(m15, on="time", how="left")
+
+                    if "atr_bridge_m15" in df.columns:
+                        df["atr"] = pd.to_numeric(
+                            df["atr_bridge_m15"], errors="coerce")
+                    elif "atr" in df.columns:
+                        df["atr"] = pd.to_numeric(df["atr"], errors="coerce")
+                else:
+                    if "atr" in df.columns:
+                        df["atr"] = pd.to_numeric(df["atr"], errors="coerce")
+                    else:
+                        df["atr"] = np.nan
 
                 trades = process_pair_day_live_style(self, day, pair, df)
 
@@ -1066,7 +1077,7 @@ class BacktestEngine1HORB:
                     day_trade_count += 1
                     day_profit += float(trade["pnl_amount"])
                     day_max_lot = max(day_max_lot, float(
-                        trade.get("lot_size", 0.0)))
+                        trade.get("lot_size", 0.0) or 0.0))
 
                     if trade["result"] == "tp":
                         day_tp_hits += 1

@@ -11,7 +11,29 @@ CYAN = "\033[96m"
 RED = "\033[91m"
 
 
+def _normalize_side(side: str) -> str:
+    return "B" if str(side).upper().startswith("B") else "S"
+
+
+def _get_pip_multiplier(pair: str) -> float:
+    return 100.0 if str(pair).upper().endswith("JPY") else 10000.0
+
+
+def _get_m1_cache(engine):
+    if not hasattr(engine, "_m1_cache"):
+        engine._m1_cache = {}
+    return engine._m1_cache
+
+
 def fetch_m1_data_for_window(engine, start_time, end_time):
+    start_time = pd.to_datetime(start_time)
+    end_time = pd.to_datetime(end_time)
+
+    cache = _get_m1_cache(engine)
+    cache_key = (engine.pair, pd.Timestamp(start_time), pd.Timestamp(end_time))
+    if cache_key in cache:
+        return cache[cache_key].copy()
+
     try:
         df_m1 = fetch_live_1m(
             engine.pair,
@@ -26,10 +48,25 @@ def fetch_m1_data_for_window(engine, start_time, end_time):
         return pd.DataFrame()
 
     df_m1 = df_m1.copy()
-    df_m1["time"] = pd.to_datetime(df_m1["time"])
-    df_m1 = df_m1.sort_values("time").reset_index(drop=True)
+    df_m1["time"] = pd.to_datetime(df_m1["time"], errors="coerce")
+    for col in ["open", "high", "low", "close"]:
+        if col in df_m1.columns:
+            df_m1[col] = pd.to_numeric(df_m1[col], errors="coerce")
 
-    return df_m1[(df_m1["time"] >= start_time) & (df_m1["time"] <= end_time)].copy()
+    df_m1 = (
+        df_m1.dropna(subset=["time", "high", "low", "close"])
+        .drop_duplicates(subset=["time"], keep="last")
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    out = df_m1[
+        (df_m1["time"] >= start_time) &
+        (df_m1["time"] <= end_time)
+    ].copy()
+
+    cache[cache_key] = out.copy()
+    return out
 
 
 def compute_m1_mae_after_entry(
@@ -48,16 +85,17 @@ def compute_m1_mae_after_entry(
     if m1_df is None or m1_df.empty:
         return 0.0, 0.0
 
+    side = _normalize_side(side)
     pip_value = StrategyCalculator.get_pip_value_per_lot(
         engine.pair, actual_entry)
-    pip_multiplier = 100.0 if engine.pair.endswith("JPY") else 10000.0
+    pip_multiplier = _get_pip_multiplier(engine.pair)
 
     max_adverse_pips = 0.0
     max_adverse_amount = 0.0
 
     for _, row in m1_df.iterrows():
-        candle_time = row["time"]
-        if candle_time <= entry_time:
+        candle_time = pd.to_datetime(row["time"])
+        if candle_time <= pd.to_datetime(entry_time):
             continue
 
         if side == "B":
@@ -84,9 +122,12 @@ def _simulate_trade_on_m1(
     tp: float,
     lot_size: float,
     tp_mode: str = "",
+    same_candle_policy: str = "conservative",
 ):
-    side = "B" if str(side).upper().startswith("B") else "S"
+    side = _normalize_side(side)
     tp_mode = str(tp_mode or "").strip().upper()
+    same_candle_policy = str(
+        same_candle_policy or "conservative").strip().lower()
     is_early_mode = tp_mode in {"TP_EARLY", "EARLY", "TPEARLY"}
 
     original_sl = float(sl)
@@ -106,14 +147,14 @@ def _simulate_trade_on_m1(
             be_trigger_price = actual_entry - (total_target_dist * 0.80)
             lock_price = actual_entry - (total_target_dist * lock_profit_pct)
 
-    entry_day = entry_time.date()
-    sim_end_time = entry_time + timedelta(days=3)
+    entry_day = pd.to_datetime(entry_time).date()
+    sim_end_time = pd.to_datetime(entry_time) + timedelta(days=3)
 
     m1_df = fetch_m1_data_for_window(engine, entry_time, sim_end_time)
     if m1_df is None or m1_df.empty:
         return {
             "result": "session_exit",
-            "exit_time": entry_time,
+            "exit_time": pd.to_datetime(entry_time),
             "exit_price": actual_entry,
             "sl": original_sl,
             "tp": original_tp,
@@ -123,8 +164,9 @@ def _simulate_trade_on_m1(
         }
 
     m1_df = m1_df.copy()
-    m1_df["time"] = pd.to_datetime(m1_df["time"])
-    m1_df = m1_df.sort_values("time").reset_index(drop=True)
+    m1_df["time"] = pd.to_datetime(m1_df["time"], errors="coerce")
+    m1_df = m1_df.dropna(subset=["time"]).sort_values(
+        "time").reset_index(drop=True)
 
     be_applied = False
     be_reason = ""
@@ -132,10 +174,10 @@ def _simulate_trade_on_m1(
     entry_found = False
     entry_fill_time = None
     last_close = actual_entry
-    last_time = entry_time
+    last_time = pd.to_datetime(entry_time)
 
     for _, row in m1_df.iterrows():
-        row_time = row["time"]
+        row_time = pd.to_datetime(row["time"])
         high = float(row["high"])
         low = float(row["low"])
         close = float(row["close"])
@@ -201,10 +243,17 @@ def _simulate_trade_on_m1(
             sl_hit = high >= sl
 
         if tp_hit and sl_hit:
+            if same_candle_policy == "optimistic":
+                exit_result = "tp"
+                exit_price = tp
+            else:
+                exit_result = "sl_lock30" if be_applied else "sl"
+                exit_price = sl
+
             return {
-                "result": "sl_lock30" if be_applied else "sl",
+                "result": exit_result,
                 "exit_time": row_time,
-                "exit_price": sl,
+                "exit_price": exit_price,
                 "sl": sl,
                 "tp": tp,
                 "be_applied": be_applied,
@@ -242,7 +291,7 @@ def _simulate_trade_on_m1(
     if not entry_found:
         return {
             "result": "session_exit",
-            "exit_time": entry_time,
+            "exit_time": pd.to_datetime(entry_time),
             "exit_price": actual_entry,
             "sl": original_sl,
             "tp": original_tp,
@@ -270,6 +319,7 @@ def resolve_same_candle_exit_with_m1(
     actual_entry: float,
     sl: float,
     tp: float,
+    tp_mode: str = "",
 ):
     resolved = _simulate_trade_on_m1(
         engine=engine,
@@ -279,7 +329,8 @@ def resolve_same_candle_exit_with_m1(
         sl=sl,
         tp=tp,
         lot_size=0.0,
-        tp_mode="",
+        tp_mode=tp_mode,
+        same_candle_policy="conservative",
     )
 
     mapped_result = resolved["result"]
@@ -300,8 +351,7 @@ def simulate_trade(
     entry_idx,
     actual_entry: float,
 ):
-    side = setup["side"]
-    side = "B" if str(side).upper().startswith("B") else "S"
+    side = _normalize_side(setup["side"])
 
     sl = float(setup["sl"])
     tp = float(setup["tp"])
@@ -321,6 +371,7 @@ def simulate_trade(
         tp=tp,
         lot_size=lot_size,
         tp_mode=tp_mode,
+        same_candle_policy="conservative",
     )
 
     exit_price = float(resolved["exit_price"])
@@ -334,7 +385,7 @@ def simulate_trade(
 
     pip_value = StrategyCalculator.get_pip_value_per_lot(
         engine.pair, actual_entry)
-    pip_multiplier = 100.0 if engine.pair.endswith("JPY") else 10000.0
+    pip_multiplier = _get_pip_multiplier(engine.pair)
 
     if side == "B":
         pnl_pips = (exit_price - actual_entry) * pip_multiplier
@@ -385,6 +436,7 @@ def simulate_trade(
         "entry_mode": entry_mode,
         "tp_mode": tp_mode,
         "sl_mode": be_reason if be_applied else "NORMAL",
+        "lock_profit_pct": lock_profit_pct,
     }
 
     engine.trades.append(trade_record)

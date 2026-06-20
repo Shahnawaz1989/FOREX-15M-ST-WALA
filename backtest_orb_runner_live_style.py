@@ -25,6 +25,7 @@ def build_intraday_live_style_candidates(engine, day_df, fund, risk_percent, gap
     for i in range(1, len(day_df)):
         partial_df = day_df.iloc[: i + 1].copy()
 
+        # invalidate existing pending setups on new pivots
         for side in ("BUY", "SELL"):
             active_setup = active_setups.get(side)
             if active_setup is not None:
@@ -32,6 +33,8 @@ def build_intraday_live_style_candidates(engine, day_df, fund, risk_percent, gap
                     setup=active_setup,
                     intraday_df=partial_df,
                 )
+                # consume updated object if needed
+                active_setups[side] = chk.get("active_setup", active_setup)
                 if chk.get("cancelled"):
                     active_setups[side] = None
 
@@ -52,6 +55,7 @@ def build_intraday_live_style_candidates(engine, day_df, fund, risk_percent, gap
             partial_candidates = [result] if result else []
             partial_all_setups = [result] if result else []
 
+        # aggregate all attempts for summary
         for item in partial_all_setups:
             if not isinstance(item, dict):
                 continue
@@ -67,6 +71,7 @@ def build_intraday_live_style_candidates(engine, day_df, fund, risk_percent, gap
                 all_seen_keys.add(all_key)
                 all_setups.append(item)
 
+        # candidate setups for this partial day
         for setup in partial_candidates:
             if not isinstance(setup, dict):
                 continue
@@ -99,7 +104,8 @@ def build_intraday_live_style_candidates(engine, day_df, fund, risk_percent, gap
             active_setups[side] = setup
 
     candidates = [
-        s for s in candidates
+        s
+        for s in candidates
         if isinstance(s, dict) and s.get("trigger_time") is not None
     ]
     candidates.sort(key=lambda s: pd.to_datetime(s.get("trigger_time")))
@@ -140,6 +146,7 @@ def process_pair_day_live_style(engine, day, pair, df):
         print(" -> Day invalid, skipping")
         return []
 
+    # keep legacy attribute if old code expects it
     engine.h1_atr_df = engine.h1_atr_df.copy()
     engine.h1atrdf = engine.h1_atr_df.copy()
 

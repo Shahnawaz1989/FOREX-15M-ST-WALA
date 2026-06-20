@@ -1,10 +1,10 @@
 # backtest_orb_runner_helpers.py
 import pandas as pd
-from typing import Dict
+from typing import Dict, List, Tuple, Any
 from backtest_orb_setup_builder import build_setup_for_day
 
 
-def detect_day_gap(df: pd.DataFrame, day) -> Dict:
+def detect_day_gap(df: pd.DataFrame, day) -> Dict[str, Any]:
     if df is None or df.empty:
         return {"status": "NO_DATA"}
 
@@ -53,6 +53,7 @@ def detect_day_gap(df: pd.DataFrame, day) -> Dict:
     today_high = float(today_first["high"])
     today_low = float(today_first["low"])
 
+    # GAP DOWN: today_high < prev_low
     if today_high < prev_low:
         gap_points = round(prev_low - today_high, 5)
         gap_percent = round((gap_points / prev_low) * 100.0,
@@ -70,6 +71,7 @@ def detect_day_gap(df: pd.DataFrame, day) -> Dict:
             "rule": "today_first_high < prev_last_low",
         }
 
+    # GAP UP: today_low > prev_high
     if today_low > prev_high:
         gap_points = round(today_low - prev_high, 5)
         gap_percent = round((gap_points / prev_high) *
@@ -232,20 +234,18 @@ def _print_total_setups_summary(all_setups):
         )
 
 
-def prepare_backtest_data(engine, specs):
-    data_by_pair = {}
-    all_dates = set()
+def prepare_backtest_data(engine, specs) -> Tuple[Dict[str, pd.DataFrame], List[pd.Timestamp]]:
+    data_by_pair: Dict[str, pd.DataFrame] = {}
+    all_dates: set = set()
 
     for spec in specs:
         pair = spec["pair"]
         csv_path = spec["csv"]
 
         df = pd.read_csv(csv_path)
-        df["time"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("time").reset_index(drop=True)
-
-        if "atr" not in df.columns:
-            df = df.copy()
+        df["time"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values(
+            "time").reset_index(drop=True)
 
         full_df = df.copy()
 
@@ -277,7 +277,7 @@ def get_weekly_risk_percent(engine, day):
     return week_num, risk_percent
 
 
-def get_day_df(engine, df, day):
+def get_day_df(engine, df: pd.DataFrame, day):
     day_df = df[df["time"].dt.date == day].copy()
     if day_df.empty:
         return day_df
@@ -318,10 +318,14 @@ def find_entry_after_trigger(engine, day_df, setup):
     trigger_time = setup["trigger_time"]
     entry_level = float(setup["entry"])
 
-    search_df = day_df[day_df["time"] >= trigger_time].copy()
+    search_df = day_df[day_df["time"].dt.tz_localize(
+        None) >= pd.Timestamp(trigger_time)].copy()
     if search_df.empty:
-        _emit_once(engine, "no_candles_after_trigger",
-                   f" -> {side} no candles after trigger_time, skip")
+        _emit_once(
+            engine,
+            "no_candles_after_trigger",
+            f" -> {side} no candles after trigger_time, skip",
+        )
         return None
 
     for idx, row in search_df.iterrows():
@@ -352,7 +356,8 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         _emit_once(
             engine,
             "hold_setup",
-            f" -> HOLD same-side setup side={side} trigger={trigger_time} because trigger <= last {side} exit {last_exit_time}",
+            f" -> HOLD same-side setup side={side} trigger={trigger_time} because "
+            f"trigger <= last {side} exit {last_exit_time}",
         )
         return None
 
@@ -428,18 +433,15 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
     except Exception:
         session_atr = None
 
-    # FORCE pending window till 23:50 server time
     window_end_server = pd.Timestamp.combine(
         pd.Timestamp(trigger_time).date(),
         pd.Timestamp("23:50:00").time(),
     )
 
     print(
-        f"  -> DEBUG: window_end_server from process_setup_candidate = {window_end_server}"
-    )
+        f"  -> DEBUG: window_end_server from process_setup_candidate = {window_end_server}")
     print(
-        f"  -> DEBUG: last candle available in day_df = {pd.Timestamp(day_df['time'].max())}"
-    )
+        f"  -> DEBUG: last candle available in day_df = {pd.Timestamp(day_df['time'].max())}")
 
     entry_result = engine._wait_for_entry_in_window(
         day_df=day_df,
