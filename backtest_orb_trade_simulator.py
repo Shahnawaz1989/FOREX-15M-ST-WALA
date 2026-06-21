@@ -11,6 +11,11 @@ CYAN = "\033[96m"
 RED = "\033[91m"
 
 
+def _warn(engine, msg: str):
+    if getattr(engine, "debug_m1", False):
+        print(YELLOW + msg + RESET)
+
+
 def _normalize_side(side: str) -> str:
     return "B" if str(side).upper().startswith("B") else "S"
 
@@ -41,7 +46,7 @@ def fetch_m1_data_for_window(engine, start_time, end_time):
             end=end_time + timedelta(minutes=1),
         )
     except Exception as e:
-        print(YELLOW + f" -> M1 fetch failed ({e})" + RESET)
+        _warn(engine, f" -> M1 fetch failed ({e})")
         return pd.DataFrame()
 
     if df_m1 is None or df_m1.empty:
@@ -350,6 +355,7 @@ def simulate_trade(
     setup: dict,
     entry_idx,
     actual_entry: float,
+    entry_time=None,
 ):
     side = _normalize_side(setup["side"])
 
@@ -359,8 +365,16 @@ def simulate_trade(
     entry_mode = setup.get("entry_mode", "")
     tp_mode = setup.get("tp_mode", "")
 
-    entry_row = df.loc[entry_idx]
-    entry_time = pd.to_datetime(entry_row["time"])
+    # IMPORTANT FIX:
+    # entry_time hamesha actual fill result se aana chahiye.
+    # Agar pass na ho to hi fallback use karo.
+    if entry_time is not None:
+        entry_time = pd.to_datetime(entry_time, errors="coerce")
+    else:
+        entry_row = df.loc[entry_idx]
+        entry_time = pd.to_datetime(entry_row["time"], errors="coerce")
+
+    print("SIM DEBUG | entry_idx =", entry_idx, "| entry_time =", entry_time)
 
     resolved = _simulate_trade_on_m1(
         engine=engine,
@@ -375,7 +389,7 @@ def simulate_trade(
     )
 
     exit_price = float(resolved["exit_price"])
-    exit_time = pd.to_datetime(resolved["exit_time"])
+    exit_time = pd.to_datetime(resolved["exit_time"], errors="coerce")
     result = resolved["result"]
     sl = float(resolved["sl"])
     tp = float(resolved["tp"])
@@ -384,7 +398,8 @@ def simulate_trade(
     lock_profit_pct = float(resolved.get("lock_profit_pct", 0.30))
 
     pip_value = StrategyCalculator.get_pip_value_per_lot(
-        engine.pair, actual_entry)
+        engine.pair, actual_entry
+    )
     pip_multiplier = _get_pip_multiplier(engine.pair)
 
     if side == "B":
@@ -416,7 +431,7 @@ def simulate_trade(
     min_available_balance_during_trade = balance_before_trade - m1_mae_amount
 
     trade_record = {
-        "date": entry_time.date(),
+        "date": entry_time.date() if pd.notna(entry_time) else None,
         "pair": engine.pair,
         "side": side,
         "entry_time": entry_time,

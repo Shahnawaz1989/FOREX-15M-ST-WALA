@@ -190,7 +190,7 @@ class BacktestEngine1HORB:
 
         # SERVER-time HH/LL disable window:
         # Detection allowed, but new order processing blocked in this window.
-        self.hhll_disable_start_server = time(22, 00)
+        self.hhll_disable_start_server = time(20, 00)
         self.hhll_disable_end_server = time(23, 45)
 
         # 🔹 Local Gann lookup load (JSON)
@@ -752,18 +752,59 @@ class BacktestEngine1HORB:
             print(f"  -> _has_setup_been_resolved_without_fill failed: {e}")
             return False
 
-    def _build_setup_for_day(
-        self,
-        day_df: pd.DataFrame,
-        fund: float,
-        risk_percent: float,
-        gap_info: Optional[Dict] = None,
-    ):
-        return build_setup_for_day(
+    def _build_setup_for_day(self, partial_df, fund=0.0, risk_percent=0.0, gap_info=None):
+        print("[VERIFY-1] ABOUT TO CALL engine._build_setup_for_day")
+        print("[VERIFY-1] pair =", getattr(self, "pair", None))
+        print("[VERIFY-1] partial_rows =", len(partial_df)
+              if partial_df is not None else None)
+        print(
+            "[VERIFY-1] partial_last_time =",
+            partial_df.iloc[-1]["time"] if partial_df is not None and len(
+                partial_df) else None,
+        )
+        print("[VERIFY-1] build_fn_module = backtest_engine_1h_orb")
+        print("[VERIFY-1] build_fn_name = _build_setup_for_day")
+        print("[VERIFY-1] partial_df_columns =", list(partial_df.columns))
+
+        if "supertrend_direction" in partial_df.columns:
+            print(
+                "[VERIFY-1] non-null supertrend_direction =",
+                int(partial_df["supertrend_direction"].notna().sum()),
+            )
+        else:
+            print("[VERIFY-1] supertrend_direction missing before builder call")
+
+        if "supertrend_signal" in partial_df.columns:
+            print(
+                "[VERIFY-1] non-null supertrend_signal =",
+                int(partial_df["supertrend_signal"].notna().sum()),
+            )
+        else:
+            print("[VERIFY-1] supertrend_signal missing before builder call")
+
+        preview_cols = [
+            c for c in [
+                "time",
+                "close",
+                "trend",
+                "signal",
+                "supertrend_direction",
+                "supertrend_signal",
+            ] if c in partial_df.columns
+        ]
+        if preview_cols:
+            print("[VERIFY-1] partial_df tail preview:")
+            print(partial_df[preview_cols].tail(10).to_string(index=False))
+
+        import backtest_orb_setup_builder
+
+        return backtest_orb_setup_builder.build_setup_for_day(
             engine=self,
-            day_df=day_df,
+            day_df=partial_df.copy(),
             fund=fund,
             risk_percent=risk_percent,
+            verbose=False,
+            hh_debug=False,
             gap_info=gap_info,
         )
 
@@ -979,6 +1020,7 @@ class BacktestEngine1HORB:
         setup: Dict,
         entry_idx,
         actual_entry: float,
+        entry_time=None,
     ):
         return simulate_trade(
             engine=self,
@@ -986,6 +1028,7 @@ class BacktestEngine1HORB:
             setup=setup,
             entry_idx=entry_idx,
             actual_entry=actual_entry,
+            entry_time=entry_time,
         )
 
     def run_backtest(self, specs) -> None:
@@ -1472,6 +1515,7 @@ class BacktestEngine1HORB:
         )
 
     def export_to_excel(self, output_path: str) -> None:
+
         folder = "backtests"
         os.makedirs(folder, exist_ok=True)
         full_path = os.path.join(folder, os.path.basename(output_path))
@@ -1479,9 +1523,12 @@ class BacktestEngine1HORB:
         total_trades = len(self.trades)
         net_pnl = self.current_fund - self.initial_fund
 
-        wins = sum(1 for t in self.trades if t["result"] == "tp")
-        sl_lock10 = sum(1 for t in self.trades if t["result"] == "sl_lock10")
-        losses = sum(1 for t in self.trades if t["result"] == "sl")
+        wins = sum(1 for t in self.trades if str(
+            t.get("result", "")).lower() == "tp")
+        sl_lock10 = sum(1 for t in self.trades if str(
+            t.get("result", "")).lower() in ("sl_lock10", "sllock10"))
+        losses = sum(1 for t in self.trades if str(
+            t.get("result", "")).lower() == "sl")
         expired = sum(
             1 for t in self.trades
             if str(t.get("result", "")).lower() == RESULT_ORDER_EXPIRED
@@ -1523,13 +1570,72 @@ class BacktestEngine1HORB:
 
         with pd.ExcelWriter(full_path, engine="openpyxl") as writer:
             if self.trades:
-                trades_df = pd.DataFrame(self.trades)
+                trades_df = pd.DataFrame(self.trades).copy()
 
-                if "entry_mode" not in trades_df.columns:
-                    trades_df["entry_mode"] = ""
+                required_defaults = {
+                    "date": pd.NaT,
+                    "pair": "",
+                    "side": "",
+                    "entry_time": pd.NaT,
+                    "entry_price": None,
+                    "sl": None,
+                    "tp": None,
+                    "exit_time": pd.NaT,
+                    "exit_price": None,
+                    "result": "",
+                    "pnl_pips": None,
+                    "pnl_amount": None,
+                    "fund_after": None,
+                    "max_adverse_pips": None,
+                    "max_adverse_amount": None,
+                    "balance_before_trade": None,
+                    "min_available_balance_during_trade": None,
+                    "entry_mode": "",
+                    "sl_mode": "NORMAL",
+                    "lot_size": None,
+                }
 
-                if "sl_mode" not in trades_df.columns:
-                    trades_df["sl_mode"] = "NORMAL"
+                for col, default_val in required_defaults.items():
+                    if col not in trades_df.columns:
+                        trades_df[col] = default_val
+
+                if "entry_time" in trades_df.columns:
+                    trades_df["entry_time"] = pd.to_datetime(
+                        trades_df["entry_time"], errors="coerce")
+
+                if "exit_time" in trades_df.columns:
+                    trades_df["exit_time"] = pd.to_datetime(
+                        trades_df["exit_time"], errors="coerce")
+
+                if "date" in trades_df.columns:
+                    trades_df["date"] = pd.to_datetime(
+                        trades_df["date"], errors="coerce")
+
+                if "entry_time" in trades_df.columns:
+                    entry_dates = trades_df["entry_time"].dt.normalize()
+                    trades_df["date"] = entry_dates.combine_first(
+                        trades_df["date"])
+
+                trades_df["date"] = trades_df["date"].dt.date
+
+                numeric_cols = [
+                    "entry_price",
+                    "sl",
+                    "tp",
+                    "exit_price",
+                    "pnl_pips",
+                    "pnl_amount",
+                    "fund_after",
+                    "max_adverse_pips",
+                    "max_adverse_amount",
+                    "balance_before_trade",
+                    "min_available_balance_during_trade",
+                    "lot_size",
+                ]
+                for col in numeric_cols:
+                    if col in trades_df.columns:
+                        trades_df[col] = pd.to_numeric(
+                            trades_df[col], errors="coerce")
 
                 trades_df["Entry From"] = trades_df["entry_mode"].apply(
                     lambda x: "T1" if isinstance(x, str) and x.endswith("_T1")
@@ -1542,7 +1648,8 @@ class BacktestEngine1HORB:
                     trades_df.insert(insert_pos, "Entry From", col)
 
                 trades_df["SL Mode"] = trades_df["sl_mode"].apply(
-                    lambda x: "SL_LOCK10" if x == "LOCK10_TP80" else "NORMAL"
+                    lambda x: "SL_LOCK10" if str(x).strip(
+                    ).upper() == "LOCK10_TP80" else "NORMAL"
                 )
 
                 preferred_order = [
@@ -1561,12 +1668,44 @@ class BacktestEngine1HORB:
                     "pnl_pips",
                     "pnl_amount",
                     "fund_after",
+                    "lot_size",
                     "max_adverse_pips",
                     "max_adverse_amount",
                     "balance_before_trade",
                     "min_available_balance_during_trade",
                     "entry_mode",
                     "sl_mode",
+
+                    # ---- EXTRA CONTEXT FIELDS ----
+                    "picked_candle_time",
+                    "trigger_time",
+                    "breakout_candle_time",
+                    "pickup_atr",
+                    "candidate_breakout_atr",
+                    "pivot_low",
+                    "pivot_high",
+                    "pivot_ref",
+                    "base_level",
+                    "breakout_extreme",
+                    "breakout_close",
+                    "pickup_buffer_divisor",
+                    "pickup_buffer_atr",
+                    "pickup_breakout_level",
+                    "target_result_price",
+                    "tp_source",
+                    "sl_source",
+                    "gann_cmp",
+                    "gann_raw_lookup_input",
+                    "gann_matched_price",
+                    "pickup_filter_valid",
+                    "pickup_filter_h1_raw",
+                    "pickup_filter_h1_cmp",
+                    "pickup_filter_threshold_cmp",
+                    "pickup_filter_m15_cmp",
+                    "pickup_filter_prev_h1_time",
+                    "candidate_mode",
+                    "supertrend_direction",
+                    "supertrend_signal",
                 ]
 
                 existing_cols = [
@@ -1581,7 +1720,7 @@ class BacktestEngine1HORB:
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
             if hasattr(self, "daily_briefings") and self.daily_briefings:
-                daily_df = pd.DataFrame(self.daily_briefings)
+                daily_df = pd.DataFrame(self.daily_briefings).copy()
 
                 rename_map = {
                     "date": "Date",
@@ -1611,8 +1750,11 @@ class BacktestEngine1HORB:
                     if col not in daily_df.columns:
                         daily_df[col] = 0.0
 
-                daily_df = daily_df[ordered_cols]
+                if "Date" in daily_df.columns:
+                    daily_df["Date"] = pd.to_datetime(
+                        daily_df["Date"], errors="coerce").dt.date
 
+                daily_df = daily_df[ordered_cols]
                 daily_df.to_excel(
                     writer, sheet_name="Day Wise Briefing", index=False)
 

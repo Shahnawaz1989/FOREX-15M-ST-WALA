@@ -1,4 +1,3 @@
-# backtest_orb_runner_helpers.py
 import pandas as pd
 from typing import Dict, List, Tuple, Any
 from backtest_orb_setup_builder import build_setup_for_day
@@ -53,7 +52,6 @@ def detect_day_gap(df: pd.DataFrame, day) -> Dict[str, Any]:
     today_high = float(today_first["high"])
     today_low = float(today_first["low"])
 
-    # GAP DOWN: today_high < prev_low
     if today_high < prev_low:
         gap_points = round(prev_low - today_high, 5)
         gap_percent = round((gap_points / prev_low) * 100.0,
@@ -71,7 +69,6 @@ def detect_day_gap(df: pd.DataFrame, day) -> Dict[str, Any]:
             "rule": "today_first_high < prev_last_low",
         }
 
-    # GAP UP: today_low > prev_high
     if today_low > prev_high:
         gap_points = round(today_low - prev_high, 5)
         gap_percent = round((gap_points / prev_high) *
@@ -161,55 +158,9 @@ def _emit_on_change(engine, category, signature, message):
     print(message)
 
 
-def _fmt_filter_status(setup):
-    def yn(v):
-        if v is True:
-            return "PASS"
-        if v is False:
-            return "FAIL"
-        return "ERROR"
-
-    side = str(setup.get("side", "")).upper().strip()
-    gap_status = str(setup.get("gap_status", "NO_GAP")).upper().strip()
-    pickup_is_first = bool(setup.get("pickup_is_first_candle", False))
-    special_entry_applied = bool(setup.get("special_entry_applied", False))
-
-    last_filter_enabled = bool(setup.get("atr_last_filter_enabled", False))
-    last_filter_valid = setup.get("atr_last_filter_valid", None)
-    last_filter_value = setup.get("atr_last_filter_value", None)
-    last_filter_threshold = setup.get("atr_last_filter_threshold", None)
-
-    if last_filter_enabled:
-        atr_last_filter_text = (
-            f"{yn(last_filter_valid)} "
-            f"(m15x2={last_filter_value}, h1={last_filter_threshold})"
-        )
-    else:
-        atr_last_filter_text = "NA (h1_atr > 100)"
-
-    return {
-        "OC_BODY": yn(setup.get("pickup_oc_filter_valid")),
-        "ATR_COMPARE": yn(setup.get("atr_compare_valid")),
-        "ATR_LAST_ROUNDOFF_X2": atr_last_filter_text,
-        "GAP_RULE": "PASS" if gap_status in ("GAP_UP", "GAP_DOWN") else f"NA ({gap_status})",
-        "FIRST_PICKUP_RULE": "PASS" if pickup_is_first else "NA (not first candle)",
-        "SPECIAL_ENTRY_CROSS": "PASS" if special_entry_applied else "NA (not crossed)",
-        "BREAKOUT_OC": "NA (not enabled)",
-        "PENDING_INVALIDATION": "NA (before pending phase)" if side in ("BUY", "SELL") else "ERROR",
-    }
-
-
-def _print_filter_summary(setup):
-    filters = _fmt_filter_status(setup)
-    print(" -> FILTERS SUMMARY")
-    for k, v in filters.items():
-        print(f"    {k}: {v}")
-
-
 def _print_total_setups_summary(all_setups):
     if not all_setups:
-        print(" -> TOTAL SETUPS SUMMARY")
-        print("    TOTAL=0 | BUY=0 | SELL=0")
+        print(" -> TOTAL SETUPS: 0 | BUY=0 | SELL=0")
         return
 
     total = len(all_setups)
@@ -218,20 +169,7 @@ def _print_total_setups_summary(all_setups):
     sell_count = sum(1 for x in all_setups if str(
         x.get("side", "")).upper() == "SELL")
 
-    print(" -> TOTAL SETUPS SUMMARY")
-    print(f"    TOTAL={total} | BUY={buy_count} | SELL={sell_count}")
-
-    for i, s in enumerate(all_setups, 1):
-        side = str(s.get("side", "UNKNOWN")).upper()
-        pickup = s.get("picked_candle_time")
-        trigger = s.get("trigger_time")
-        status = str(s.get("status", "UNKNOWN")).upper()
-        reason = str(s.get("reason", ""))
-
-        print(
-            f"    {i}. side={side} | picked={pickup} | trigger={trigger} | "
-            f"status={status} | reason={reason}"
-        )
+    print(f" -> TOTAL SETUPS: {total} | BUY={buy_count} | SELL={sell_count}")
 
 
 def prepare_backtest_data(engine, specs) -> Tuple[Dict[str, pd.DataFrame], List[pd.Timestamp]]:
@@ -338,13 +276,9 @@ def find_entry_after_trigger(engine, day_df, setup):
         if side == "SELL" and l <= entry_level:
             return idx
 
-    msg = f" -> {side} pending not filled for the day"
-    sig = (
-        side,
-        str(pd.Timestamp(trigger_time)),
-        _safe_round(entry_level),
-    )
-    _emit_on_change(engine, "pending_not_filled", sig, msg)
+    sig = (side, str(pd.Timestamp(trigger_time)), _safe_round(entry_level))
+    _emit_on_change(engine, "pending_not_filled", sig,
+                    f" -> {side} pending not filled for the day")
     return None
 
 
@@ -356,8 +290,7 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         _emit_once(
             engine,
             "hold_setup",
-            f" -> HOLD same-side setup side={side} trigger={trigger_time} because "
-            f"trigger <= last {side} exit {last_exit_time}",
+            f" -> HOLD same-side setup side={side} trigger={trigger_time} because trigger <= last {side} exit {last_exit_time}",
         )
         return None
 
@@ -365,67 +298,24 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         _emit_once(
             engine,
             "disable_window",
-            f" -> {engine.pair} {side} setup detected in HH/LL disable window "
-            f"(half-process mode in live, skip in backtest)",
+            f" -> {engine.pair} {side} setup detected in HH/LL disable window (half-process mode in live, skip in backtest)",
         )
         return None
 
-    entry_txt = f"{float(setup['entry']):.5f}" if setup.get(
-        "entry") is not None else "None"
-    sl_txt = f"{float(setup['sl']):.5f}" if setup.get(
-        "sl") is not None else "None"
-    tp_txt = f"{float(setup['tp']):.5f}" if setup.get(
-        "tp") is not None else "None"
+    if setup.get("entry") is None or setup.get("sl") is None or setup.get("tp") is None:
+        return None
 
     setup_sig = _setup_signature(setup)
     setup_msg = (
-        f" -> Chosen setup: side={side}, "
-        f"picked_candle_time={setup.get('picked_candle_time')}, "
-        f"trigger_time={trigger_time}, "
-        f"breakout_time={setup.get('breakout_candle_time')}, "
-        f"breakout_close={setup.get('breakout_close')}, "
-        f"entry_mode={setup.get('entry_mode')}, "
-        f"entry={entry_txt}, SL={sl_txt}, TP={tp_txt}, "
-        f"pickup_atr={setup.get('pickup_atr')}, "
-        f"pickup_buffer_atr5={setup.get('pickup_buffer_atr5')}, "
-        f"pickup_breakout_level={setup.get('pickup_breakout_level')}, "
-        f"target_result_price={setup.get('target_result_price')}, "
-        f"tp_mode={setup.get('tp_mode')}, "
-        f"m15_atr={setup.get('candidate_breakout_atr')}, "
-        f"m15_cmp={setup.get('atr_compare_m15_candidate_cmp')}, "
-        f"h1_raw={setup.get('atr_compare_h1_raw')}, "
-        f"h1_cmp={setup.get('atr_compare_h1_round')}, "
-        f"h1_result_cmp={setup.get('atr_compare_h1_result')}, "
-        f"atr_valid={setup.get('atr_compare_valid')}, "
-        f"atr_last_filter_enabled={setup.get('atr_last_filter_enabled')}, "
-        f"atr_last_filter_valid={setup.get('atr_last_filter_valid')}, "
-        f"atr_last_filter_value={setup.get('atr_last_filter_value')}, "
-        f"atr_last_filter_threshold={setup.get('atr_last_filter_threshold')}, "
-        f"sl_source={setup.get('sl_source')}, "
-        f"tp_source={setup.get('tp_source')}, "
-        f"special_entry_atr_multiplier={setup.get('special_entry_atr_multiplier')}, "
-        f"special_entry_h1_below_50_active={setup.get('special_entry_h1_below_50_active')}, "
-        f"gann_cmp={setup.get('gann_cmp')}"
+        f" -> SETUP {side} | "
+        f"picked={setup.get('picked_candle_time')} | "
+        f"trigger={trigger_time} | "
+        f"mode={setup.get('candidate_mode')} | "
+        f"entry={float(setup['entry']):.5f} | "
+        f"sl={float(setup['sl']):.5f} | "
+        f"tp={float(setup['tp']):.5f}"
     )
     _emit_on_change(engine, "chosen_setup", setup_sig, setup_msg)
-
-    _print_filter_summary(setup)
-
-    if setup.get("entry") is None or setup.get("sl") is None or setup.get("tp") is None:
-        incomplete_sig = (
-            setup_sig,
-            "incomplete",
-            _safe_round(setup.get("entry")),
-            _safe_round(setup.get("sl")),
-            _safe_round(setup.get("tp")),
-        )
-        incomplete_msg = (
-            f" -> DEBUG ONLY: incomplete setup, skip simulation "
-            f"entry={setup.get('entry')}, sl={setup.get('sl')}, tp={setup.get('tp')}"
-        )
-        _emit_on_change(engine, "incomplete_setup",
-                        incomplete_sig, incomplete_msg)
-        return None
 
     session_atr = setup.get("pickup_atr")
     try:
@@ -437,11 +327,6 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         pd.Timestamp(trigger_time).date(),
         pd.Timestamp("23:50:00").time(),
     )
-
-    print(
-        f"  -> DEBUG: window_end_server from process_setup_candidate = {window_end_server}")
-    print(
-        f"  -> DEBUG: last candle available in day_df = {pd.Timestamp(day_df['time'].max())}")
 
     entry_result = engine._wait_for_entry_in_window(
         day_df=day_df,
@@ -455,14 +340,14 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
 
     entry_idx = entry_result["entry_idx"]
     entry_level = float(entry_result["actual_entry"])
+    entry_time = pd.to_datetime(
+        entry_result.get("entry_time"), errors="coerce")
+
     sl = float(setup["sl"])
     tp = float(setup["tp"])
     lot = float(setup["lot_size"])
 
-    print(
-        f" -> {side} Entry filled at {df.loc[entry_idx, 'time']}, "
-        f"price={entry_level:.5f}"
-    )
+    print(f" -> {side} ENTRY at {entry_time} | price={entry_level:.5f}")
 
     sim_setup = {
         "side": side,
@@ -479,13 +364,79 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         setup=sim_setup,
         entry_idx=entry_idx,
         actual_entry=entry_level,
+        entry_time=entry_time,
     )
 
     print(
-        f" -> {side} Exit {trade['result']} at {trade['exit_time']}, "
-        f"price={trade['exit_price']:.5f}, "
-        f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
+        f" -> {side} EXIT {trade['result']} | "
+        f"time={trade['exit_time']} | "
+        f"price={trade['exit_price']:.5f} | "
+        f"PNL=${trade['pnl_amount']:.2f} | "
+        f"Fund=${trade['fund_after']:.2f}"
     )
+
+    # Ensure core fields
+    if "entry_time" not in trade or pd.isna(trade["entry_time"]):
+        trade["entry_time"] = entry_time
+    if "pair" not in trade:
+        trade["pair"] = getattr(engine, "pair", "")
+    if "side" not in trade:
+        trade["side"] = side
+    if "lot_size" not in trade:
+        trade["lot_size"] = lot
+
+    # ---- EXTRA SETUP METADATA FOR EXCEL ----
+    # Times
+    trade["picked_candle_time"] = pd.to_datetime(
+        setup.get("picked_candle_time"), errors="coerce"
+    )
+    trade["trigger_time"] = pd.to_datetime(
+        setup.get("trigger_time"), errors="coerce"
+    )
+    trade["breakout_candle_time"] = pd.to_datetime(
+        setup.get("breakout_candle_time"), errors="coerce"
+    )
+
+    # ATR info
+    trade["pickup_atr"] = setup.get("pickup_atr")
+    trade["candidate_breakout_atr"] = setup.get("candidate_breakout_atr")
+
+    # Levels / pivots
+    trade["pivot_low"] = setup.get("pivot_low")
+    trade["pivot_high"] = setup.get("pivot_high")
+    trade["pivot_ref"] = setup.get("pivot_ref")
+    trade["base_level"] = setup.get("base_level")
+    trade["breakout_extreme"] = setup.get("breakout_extreme")
+    trade["breakout_close"] = setup.get("breakout_close")
+
+    # Buffer / breakout
+    trade["pickup_buffer_divisor"] = setup.get("pickup_buffer_divisor")
+    trade["pickup_buffer_atr"] = setup.get("pickup_buffer_atr")
+    trade["pickup_breakout_level"] = setup.get("pickup_breakout_level")
+
+    # Targeting / Gann
+    trade["target_result_price"] = setup.get("target_result_price")
+    trade["tp_source"] = setup.get("tp_source")
+    trade["sl_source"] = setup.get("sl_source")
+    trade["gann_cmp"] = setup.get("gann_cmp")
+    trade["gann_raw_lookup_input"] = setup.get("gann_raw_lookup_input")
+    trade["gann_matched_price"] = setup.get("gann_matched_price")
+
+    # H1 ATR filter snapshot
+    trade["pickup_filter_valid"] = setup.get("pickup_filter_valid")
+    trade["pickup_filter_h1_raw"] = setup.get("pickup_filter_h1_raw")
+    trade["pickup_filter_h1_cmp"] = setup.get("pickup_filter_h1_cmp")
+    trade["pickup_filter_threshold_cmp"] = setup.get(
+        "pickup_filter_threshold_cmp")
+    trade["pickup_filter_m15_cmp"] = setup.get("pickup_filter_m15_cmp")
+    trade["pickup_filter_prev_h1_time"] = pd.to_datetime(
+        setup.get("pickup_filter_prev_h1_time"), errors="coerce"
+    )
+
+    # Supertrend / candidate mode
+    trade["candidate_mode"] = setup.get("candidate_mode")
+    trade["supertrend_direction"] = setup.get("supertrend_direction")
+    trade["supertrend_signal"] = setup.get("supertrend_signal")
 
     return trade
 
@@ -512,8 +463,6 @@ def process_pair_day(engine, day, pair, df):
 
     print(f" -> Week {week_num}: Risk={risk_percent:.1f}%")
     print(f" -> Sizing Fund: ${raw_fund:,.2f}")
-
-    print("\n" + "-" * 30)
     print(" -> New Day High/Low pattern processing")
 
     candidates, all_setups = build_day_setups(

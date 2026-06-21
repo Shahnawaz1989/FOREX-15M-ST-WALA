@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from strategy_calculator import StrategyCalculator
 
+print(">>> backtest_orb_setup_builder loaded")
+
 
 def _dbg(verbose: bool, msg: str):
     if verbose:
@@ -15,6 +17,35 @@ def _round5(x):
 
 def _gann_lookup_price(x: float) -> float:
     return np.floor(float(x) * 10000) / 10000.0
+
+
+def _atr_cmp(x: float) -> Optional[int]:
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if not np.isfinite(v) or v <= 0:
+        return None
+    return int(round(v * 100000))
+
+
+def _digit_count_from_cmp(cmp_val: Optional[int]) -> Optional[int]:
+    if cmp_val is None:
+        return None
+    cmp_val = abs(int(cmp_val))
+    return len(str(cmp_val))
+
+
+def _is_digit_imbalance(pickup_atr: float, candidate_atr: float) -> bool:
+    p_cmp = _atr_cmp(pickup_atr)
+    c_cmp = _atr_cmp(candidate_atr)
+    p_digits = _digit_count_from_cmp(p_cmp)
+    c_digits = _digit_count_from_cmp(c_cmp)
+    return p_digits == 2 and c_digits == 3
+
+
+def _reduce_atr_by_30_percent(x: float) -> float:
+    return float(x) * 0.70
 
 
 def _record_attempt(
@@ -34,6 +65,11 @@ def _record_attempt(
     if extra:
         row.update(extra)
     all_attempts.append(row)
+
+    print(
+        f" -> ATTEMPT | side={row['side']} | picked={row['picked_candle_time']} | "
+        f"status={row['status']} | reason={row['reason']}"
+    )
 
 
 def _find_nearest_buy_target(
@@ -155,8 +191,8 @@ def _get_h1_context_for_time(engine, ref_time, verbose=False):
 
     if verbose:
         print(
-            f" -> H1_CONTEXT | ref_time={bt} | used_prev_h1={prev_time} | "
-            f"h1_atr_raw={prev_h1_atr:.6f} | h1_atr_cmp={result['h1_atr_cmp']:.2f}"
+            f" -> H1_CONTEXT | ref_time={bt} | prev_h1={prev_time} | "
+            f"h1_raw={result['h1_atr_raw']} | h1_cmp={result['h1_atr_cmp']}"
         )
 
     return result
@@ -174,6 +210,7 @@ def _pickup_filter_pass(engine, pickup_time, pickup_atr, verbose=False):
         "reason": None,
     }
 
+    # 15m ATR validate
     try:
         pickup_atr = float(pickup_atr)
     except Exception:
@@ -184,17 +221,21 @@ def _pickup_filter_pass(engine, pickup_time, pickup_atr, verbose=False):
         result["reason"] = "pickup_atr_invalid"
         return result
 
+    # H1 context
     h1ctx = _get_h1_context_for_time(engine, pickup_time, verbose=verbose)
     if not h1ctx["valid"]:
         result["reason"] = h1ctx["reason"]
         result["prev_h1_time"] = h1ctx.get("prev_h1_time")
         return result
 
+    # Compare values (x100000 cmp units)
     pickup_cmp = round(pickup_atr * 100000, 2)
     h1_cmp = float(h1ctx["h1_atr_cmp"])
-    threshold_cmp = round(h1_cmp * 0.70, 2)
 
-    compare_ok = pickup_cmp <= threshold_cmp
+    # RULE: 15m ATR < 70% of previous closed 1H ATR
+    pickup_filter_multiplier = 0.70
+    threshold_cmp = round(h1_cmp * pickup_filter_multiplier, 2)
+    compare_ok = pickup_cmp < threshold_cmp  # strictly less than 70%
 
     result["valid"] = compare_ok
     result["pickup_atr_raw"] = _round5(pickup_atr)
@@ -205,13 +246,11 @@ def _pickup_filter_pass(engine, pickup_time, pickup_atr, verbose=False):
     result["prev_h1_time"] = h1ctx["prev_h1_time"]
     result["reason"] = "passed" if compare_ok else "pickup_atr_compare_failed"
 
-    if verbose:
-        print(
-            f" -> PICKUP_ATR_FILTER | pickup_time={pickup_time} | "
-            f"prev_h1_time={result['prev_h1_time']} | "
-            f"h1_cmp={h1_cmp:.2f} | threshold_cmp={threshold_cmp:.2f} | "
-            f"pickup_cmp={pickup_cmp:.2f} | pass={compare_ok}"
-        )
+    print(
+        f" -> PICKUP_FILTER | time={pickup_time} | "
+        f"pickup_cmp={pickup_cmp} | h1_cmp={h1_cmp} | "
+        f"threshold={threshold_cmp} | pass={compare_ok}"
+    )
 
     return result
 
@@ -219,7 +258,7 @@ def _pickup_filter_pass(engine, pickup_time, pickup_atr, verbose=False):
 def _candidate_buffer_from_pickup_atr(pickup_atr: float):
     cmp_val = round(float(pickup_atr) * 100000, 2)
 
-    if cmp_val <= 30:
+    if cmp_val <= 35:
         divisor = 1.0
     elif cmp_val <= 50:
         divisor = 2.0
@@ -238,24 +277,50 @@ def _candidate_buffer_from_pickup_atr(pickup_atr: float):
     }
 
 
-def _is_st_flip_buy(row):
+def _st_state(row):
+    """Normalize ST state from direction/signal."""
     trend = str(row.get("supertrend_direction", "")).upper().strip()
     signal = str(row.get("supertrend_signal", "")).upper().strip()
-    return signal == "BUY" or trend == "BUY_TREND"
+
+    if signal in ("BUY", "SELL"):
+        return signal
+
+    if trend == "BUY_TREND":
+        return "BUY"
+    if trend == "SELL_TREND":
+        return "SELL"
+
+    return "NONE"
 
 
-def _is_st_flip_sell(row):
-    trend = str(row.get("supertrend_direction", "")).upper().strip()
-    signal = str(row.get("supertrend_signal", "")).upper().strip()
-    return signal == "SELL" or trend == "SELL_TREND"
+def _is_st_flip_buy(prev_row, curr_row) -> bool:
+    """True only when this candle flips INTO BUY."""
+    prev = _st_state(prev_row) if prev_row is not None else "NONE"
+    curr = _st_state(curr_row)
+    return prev != "BUY" and curr == "BUY"
+
+
+def _is_st_flip_sell(prev_row, curr_row) -> bool:
+    """True only when this candle flips INTO SELL."""
+    prev = _st_state(prev_row) if prev_row is not None else "NONE"
+    curr = _st_state(curr_row)
+    return prev != "SELL" and curr == "SELL"
 
 
 def _find_buy_candidate(xdf: pd.DataFrame, start_idx: int, pickup_high: float, pickup_atr: float):
+    """
+    BUY side:
+    - PICKUP_ST_SAME_CANDLE   -> LL pickup candle par hi ST BUY flip.
+    - BREAKOUT_ST_SAME_CANDLE -> breakout candle par naya ST BUY flip.
+    """
     pickup_row = xdf.iloc[start_idx]
+    prev_pickup = xdf.iloc[start_idx - 1] if start_idx > 0 else None
+
     buf = _candidate_buffer_from_pickup_atr(pickup_atr)
     breakout_level = float(pickup_high) + float(buf["buffer_raw"])
 
-    if _is_st_flip_buy(pickup_row):
+    # LOGIC A: pickup LL candle par flip
+    if _is_st_flip_buy(prev_pickup, pickup_row):
         return {
             "candidate_row": pickup_row,
             "candidate_index": start_idx,
@@ -264,27 +329,44 @@ def _find_buy_candidate(xdf: pd.DataFrame, start_idx: int, pickup_high: float, p
             "buffer_info": buf,
         }
 
+    # LOGIC B: breakout candle par hi naya flip
     for j in range(start_idx + 1, len(xdf)):
         r = xdf.iloc[j]
         c = float(r["close"])
-        if c >= breakout_level and _is_st_flip_buy(r):
-            return {
-                "candidate_row": r,
-                "candidate_index": j,
-                "candidate_mode": "BREAKOUT_CLOSE_WITH_ST_FLIP",
-                "breakout_level": _round5(breakout_level),
-                "buffer_info": buf,
-            }
+
+        if c >= breakout_level:
+            prev = xdf.iloc[j - 1] if j > 0 else None
+
+            # breakout candle par naya BUY flip?
+            if _is_st_flip_buy(prev, r):
+                return {
+                    "candidate_row": r,
+                    "candidate_index": j,
+                    "candidate_mode": "BREAKOUT_ST_SAME_CANDLE",
+                    "breakout_level": _round5(breakout_level),
+                    "buffer_info": buf,
+                }
+
+            # Breakout mil gaya, lekin is candle par flip nahi -> INVALID
+            return None
 
     return None
 
 
 def _find_sell_candidate(xdf: pd.DataFrame, start_idx: int, pickup_low: float, pickup_atr: float):
+    """
+    SELL side:
+    - PICKUP_ST_SAME_CANDLE   -> HH pickup candle par hi ST SELL flip.
+    - BREAKOUT_ST_SAME_CANDLE -> breakout candle par naya ST SELL flip.
+    """
     pickup_row = xdf.iloc[start_idx]
+    prev_pickup = xdf.iloc[start_idx - 1] if start_idx > 0 else None
+
     buf = _candidate_buffer_from_pickup_atr(pickup_atr)
     breakout_level = float(pickup_low) - float(buf["buffer_raw"])
 
-    if _is_st_flip_sell(pickup_row):
+    # LOGIC A: pickup HH candle par flip
+    if _is_st_flip_sell(prev_pickup, pickup_row):
         return {
             "candidate_row": pickup_row,
             "candidate_index": start_idx,
@@ -293,19 +375,133 @@ def _find_sell_candidate(xdf: pd.DataFrame, start_idx: int, pickup_low: float, p
             "buffer_info": buf,
         }
 
+    # LOGIC B: breakout candle par hi naya flip
     for j in range(start_idx + 1, len(xdf)):
         r = xdf.iloc[j]
         c = float(r["close"])
-        if c <= breakout_level and _is_st_flip_sell(r):
-            return {
-                "candidate_row": r,
-                "candidate_index": j,
-                "candidate_mode": "BREAKOUT_CLOSE_WITH_ST_FLIP",
-                "breakout_level": _round5(breakout_level),
-                "buffer_info": buf,
-            }
+
+        if c <= breakout_level:
+            prev = xdf.iloc[j - 1] if j > 0 else None
+
+            # breakout candle par naya SELL flip?
+            if _is_st_flip_sell(prev, r):
+                return {
+                    "candidate_row": r,
+                    "candidate_index": j,
+                    "candidate_mode": "BREAKOUT_ST_SAME_CANDLE",
+                    "breakout_level": _round5(breakout_level),
+                    "buffer_info": buf,
+                }
+
+            # Breakout mil gaya, lekin is candle par flip nahi -> INVALID
+            return None
 
     return None
+
+
+def _resolve_buy_target(levels: Dict[str, float], breakout_high: float, candidate_atr: float, final_entry_price: float, pickup_atr: float):
+    candidate_cmp = _atr_cmp(candidate_atr)
+    pickup_cmp = _atr_cmp(pickup_atr)
+
+    digit_imbalance = _is_digit_imbalance(pickup_atr, candidate_atr)
+    target_calc_mode = None
+    target_atr_used = None
+
+    if digit_imbalance:
+        new_atr = _reduce_atr_by_30_percent(candidate_atr)
+        raw_target = _round5(float(breakout_high) + new_atr * 4.0)
+        target_calc_mode = "DIGIT_IMBALANCE_NEWATR_X4"
+        target_atr_used = _round5(new_atr)
+    elif candidate_cmp is not None and candidate_cmp <= 50:
+        raw_target = _round5(float(breakout_high) +
+                             float(candidate_atr) * 10.0)
+        target_calc_mode = "ATR_LE_50_X10"
+        target_atr_used = _round5(candidate_atr)
+    else:
+        raw_target = _round5(float(breakout_high) + float(candidate_atr) * 5.0)
+        target_calc_mode = "NORMAL_X5"
+        target_atr_used = _round5(candidate_atr)
+
+    early_mode = raw_target <= float(final_entry_price)
+
+    final_tp_key = None
+    final_tp = None
+    if early_mode and levels.get("buy_t1") is not None:
+        final_tp_key = "buy_t1"
+        final_tp = float(levels["buy_t1"])
+    else:
+        nearest = _find_nearest_buy_target(
+            levels, raw_target, final_entry_price)
+        if nearest:
+            final_tp_key = nearest["target_key"]
+            final_tp = float(nearest["target_price"])
+        elif levels.get("buy_t1") is not None:
+            final_tp_key = "buy_t1"
+            final_tp = float(levels["buy_t1"])
+
+    return {
+        "final_tp": _round5(final_tp) if final_tp is not None else None,
+        "final_tp_key": final_tp_key,
+        "raw_target": _round5(raw_target),
+        "early_mode": early_mode,
+        "target_calc_mode": target_calc_mode,
+        "target_atr_used": target_atr_used,
+        "digit_imbalance": digit_imbalance,
+        "pickup_atr_cmp_int": pickup_cmp,
+        "candidate_atr_cmp_int": candidate_cmp,
+    }
+
+
+def _resolve_sell_target(levels: Dict[str, float], breakout_low: float, candidate_atr: float, final_entry_price: float, pickup_atr: float):
+    candidate_cmp = _atr_cmp(candidate_atr)
+    pickup_cmp = _atr_cmp(pickup_atr)
+
+    digit_imbalance = _is_digit_imbalance(pickup_atr, candidate_atr)
+    target_calc_mode = None
+    target_atr_used = None
+
+    if digit_imbalance:
+        new_atr = _reduce_atr_by_30_percent(candidate_atr)
+        raw_target = _round5(float(breakout_low) - new_atr * 4.0)
+        target_calc_mode = "DIGIT_IMBALANCE_NEWATR_X4"
+        target_atr_used = _round5(new_atr)
+    elif candidate_cmp is not None and candidate_cmp <= 50:
+        raw_target = _round5(float(breakout_low) - float(candidate_atr) * 10.0)
+        target_calc_mode = "ATR_LE_50_X10"
+        target_atr_used = _round5(candidate_atr)
+    else:
+        raw_target = _round5(float(breakout_low) - float(candidate_atr) * 5.0)
+        target_calc_mode = "NORMAL_X5"
+        target_atr_used = _round5(candidate_atr)
+
+    early_mode = raw_target >= float(final_entry_price)
+
+    final_tp_key = None
+    final_tp = None
+    if early_mode and levels.get("sell_t1") is not None:
+        final_tp_key = "sell_t1"
+        final_tp = float(levels["sell_t1"])
+    else:
+        nearest = _find_nearest_sell_target(
+            levels, raw_target, final_entry_price)
+        if nearest:
+            final_tp_key = nearest["target_key"]
+            final_tp = float(nearest["target_price"])
+        elif levels.get("sell_t1") is not None:
+            final_tp_key = "sell_t1"
+            final_tp = float(levels["sell_t1"])
+
+    return {
+        "final_tp": _round5(final_tp) if final_tp is not None else None,
+        "final_tp_key": final_tp_key,
+        "raw_target": _round5(raw_target),
+        "early_mode": early_mode,
+        "target_calc_mode": target_calc_mode,
+        "target_atr_used": target_atr_used,
+        "digit_imbalance": digit_imbalance,
+        "pickup_atr_cmp_int": pickup_cmp,
+        "candidate_atr_cmp_int": candidate_cmp,
+    }
 
 
 def _build_ll_buy_setup(
@@ -371,29 +567,25 @@ def _build_ll_buy_setup(
         _record_attempt(all_attempts, side, picked_time,
                         "REJECTED", "buy_at_missing")
         return None
-
-    final_entry_price = _round5(float(gann_levels["buy_at"]))
-
-    if levels.get("sell_super_middle") is None:
+    if gann_levels.get("sell_at") is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "sell_super_middle_missing")
+                        "REJECTED", "sell_at_missing")
         return None
 
-    final_sl = _round5(
-        float(levels["sell_super_middle"]) - (candidate_atr / 10.0))
+    final_entry_price = _round5(float(gann_levels["buy_at"]))
+    final_sl = _round5(float(gann_levels["sell_at"]))
 
-    raw_target_result = _round5(breakout_high + candidate_atr * 5.0)
-    nearest = _find_nearest_buy_target(
-        levels, raw_target_result, final_entry_price)
+    tp_info = _resolve_buy_target(
+        levels=levels,
+        breakout_high=breakout_high,
+        candidate_atr=candidate_atr,
+        final_entry_price=final_entry_price,
+        pickup_atr=pickup_atr,
+    )
 
-    final_tp_key = None
-    final_tp = None
-    if nearest:
-        final_tp_key = nearest["target_key"]
-        final_tp = float(nearest["target_price"])
-    elif levels.get("buy_t1") is not None:
-        final_tp_key = "buy_t1"
-        final_tp = float(levels["buy_t1"])
+    final_tp = tp_info["final_tp"]
+    final_tp_key = tp_info["final_tp_key"]
+    raw_target_result = tp_info["raw_target"]
 
     if final_tp is None:
         _record_attempt(all_attempts, side, picked_time,
@@ -421,7 +613,7 @@ def _build_ll_buy_setup(
         "entry_mode": "BUY_AT",
         "entry_key": "buy_at",
         "target_mode": final_tp_key.upper() if final_tp_key else None,
-        "tp_mode": "OLD_PLACEHOLDER",
+        "tp_mode": tp_info["target_calc_mode"],
         "trigger_time": breakout_time,
         "picked_candle_time": picked_time,
         "breakout_candle_time": breakout_time,
@@ -433,6 +625,11 @@ def _build_ll_buy_setup(
         "breakout_close": _round5(breakout_close),
         "pickup_atr": _round5(pickup_atr),
         "candidate_breakout_atr": _round5(candidate_atr),
+        "pickup_atr_cmp_int": tp_info["pickup_atr_cmp_int"],
+        "candidate_atr_cmp_int": tp_info["candidate_atr_cmp_int"],
+        "digit_imbalance": tp_info["digit_imbalance"],
+        "early_mode": tp_info["early_mode"],
+        "target_atr_used": tp_info["target_atr_used"],
         "pickup_filter_valid": pickup_filter["valid"],
         "pickup_filter_h1_raw": pickup_filter["h1_atr_raw"],
         "pickup_filter_h1_cmp": pickup_filter["h1_atr_cmp"],
@@ -448,7 +645,7 @@ def _build_ll_buy_setup(
         "gann_raw_lookup_input": gann_levels.get("raw_lookup_input"),
         "gann_matched_price": gann_levels.get("matched_price"),
         "gann_levels": levels,
-        "sl_source": "SELL_SUPER_MIDDLE_MINUS_CANDIDATE_ATR10",
+        "sl_source": "SELL_AT",
         "tp_source": final_tp_key,
         "status": "PENDING",
         "setup_valid": True,
@@ -465,6 +662,8 @@ def _build_ll_buy_setup(
             "entry": setup["entry"],
             "sl": setup["sl"],
             "tp": setup["tp"],
+            "early_mode": setup["early_mode"],
+            "digit_imbalance": setup["digit_imbalance"],
         },
     )
     return setup
@@ -533,29 +732,25 @@ def _build_hh_sell_setup(
         _record_attempt(all_attempts, side, picked_time,
                         "REJECTED", "sell_at_missing")
         return None
-
-    final_entry_price = _round5(float(gann_levels["sell_at"]))
-
-    if levels.get("buy_super_middle") is None:
+    if gann_levels.get("buy_at") is None:
         _record_attempt(all_attempts, side, picked_time,
-                        "REJECTED", "buy_super_middle_missing")
+                        "REJECTED", "buy_at_missing")
         return None
 
-    final_sl = _round5(
-        float(levels["buy_super_middle"]) + (candidate_atr / 10.0))
+    final_entry_price = _round5(float(gann_levels["sell_at"]))
+    final_sl = _round5(float(gann_levels["buy_at"]))
 
-    raw_target_result = _round5(breakout_low - candidate_atr * 5.0)
-    nearest = _find_nearest_sell_target(
-        levels, raw_target_result, final_entry_price)
+    tp_info = _resolve_sell_target(
+        levels=levels,
+        breakout_low=breakout_low,
+        candidate_atr=candidate_atr,
+        final_entry_price=final_entry_price,
+        pickup_atr=pickup_atr,
+    )
 
-    final_tp_key = None
-    final_tp = None
-    if nearest:
-        final_tp_key = nearest["target_key"]
-        final_tp = float(nearest["target_price"])
-    elif levels.get("sell_t1") is not None:
-        final_tp_key = "sell_t1"
-        final_tp = float(levels["sell_t1"])
+    final_tp = tp_info["final_tp"]
+    final_tp_key = tp_info["final_tp_key"]
+    raw_target_result = tp_info["raw_target"]
 
     if final_tp is None:
         _record_attempt(all_attempts, side, picked_time,
@@ -583,7 +778,7 @@ def _build_hh_sell_setup(
         "entry_mode": "SELL_AT",
         "entry_key": "sell_at",
         "target_mode": final_tp_key.upper() if final_tp_key else None,
-        "tp_mode": "OLD_PLACEHOLDER",
+        "tp_mode": tp_info["target_calc_mode"],
         "trigger_time": breakout_time,
         "picked_candle_time": picked_time,
         "breakout_candle_time": breakout_time,
@@ -595,6 +790,11 @@ def _build_hh_sell_setup(
         "breakout_close": _round5(breakout_close),
         "pickup_atr": _round5(pickup_atr),
         "candidate_breakout_atr": _round5(candidate_atr),
+        "pickup_atr_cmp_int": tp_info["pickup_atr_cmp_int"],
+        "candidate_atr_cmp_int": tp_info["candidate_atr_cmp_int"],
+        "digit_imbalance": tp_info["digit_imbalance"],
+        "early_mode": tp_info["early_mode"],
+        "target_atr_used": tp_info["target_atr_used"],
         "pickup_filter_valid": pickup_filter["valid"],
         "pickup_filter_h1_raw": pickup_filter["h1_atr_raw"],
         "pickup_filter_h1_cmp": pickup_filter["h1_atr_cmp"],
@@ -610,7 +810,7 @@ def _build_hh_sell_setup(
         "gann_raw_lookup_input": gann_levels.get("raw_lookup_input"),
         "gann_matched_price": gann_levels.get("matched_price"),
         "gann_levels": levels,
-        "sl_source": "BUY_SUPER_MIDDLE_PLUS_CANDIDATE_ATR10",
+        "sl_source": "BUY_AT",
         "tp_source": final_tp_key,
         "status": "PENDING",
         "setup_valid": True,
@@ -627,6 +827,8 @@ def _build_hh_sell_setup(
             "entry": setup["entry"],
             "sl": setup["sl"],
             "tp": setup["tp"],
+            "early_mode": setup["early_mode"],
+            "digit_imbalance": setup["digit_imbalance"],
         },
     )
     return setup
@@ -642,7 +844,6 @@ def build_setup_for_day(
     gap_info: Optional[Dict] = None,
 ):
     if day_df is None or day_df.empty:
-        print(" [SETUP DEBUG] day_df empty -> no setup")
         return {"chosen_setups": [], "all_setups": []}
 
     xdf = day_df.copy()
@@ -653,6 +854,15 @@ def build_setup_for_day(
         .reset_index(drop=True)
     )
 
+    st_cols = [c for c in ["supertrend_direction",
+                           "supertrend_signal", "trend", "signal"] if c in xdf.columns]
+    nn_dir = int(xdf["supertrend_direction"].notna().sum()
+                 ) if "supertrend_direction" in xdf.columns else 0
+    nn_sig = int(xdf["supertrend_signal"].notna().sum()
+                 ) if "supertrend_signal" in xdf.columns else 0
+    print(
+        f" -> BUILDER INPUT | st_cols={st_cols} | nn_dir={nn_dir} | nn_sig={nn_sig}")
+
     required_cols = ["open", "high", "low", "close", "atr"]
     for col in required_cols:
         if col in xdf.columns:
@@ -661,16 +871,24 @@ def build_setup_for_day(
     xdf = xdf.dropna(subset=required_cols).reset_index(drop=True)
 
     if xdf.empty:
-        print(" [SETUP DEBUG] xdf empty after numeric cleanup -> no setup")
         return {"chosen_setups": [], "all_setups": []}
 
     all_attempts: List[Dict] = []
 
     buy_setup = _build_ll_buy_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
+        engine,
+        xdf,
+        all_attempts=all_attempts,
+        hh_debug=hh_debug,
+        gap_info=gap_info,
     )
+
     sell_setup = _build_hh_sell_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
+        engine,
+        xdf,
+        all_attempts=all_attempts,
+        hh_debug=hh_debug,
+        gap_info=gap_info,
     )
 
     chosen_setups: List[Dict] = []
